@@ -137,17 +137,21 @@ func (s *Restore) FreeVirtualIP(req FreeVirtualIP) error {
 	return s.tx.Insert(tableFreeVirtualIPs, req)
 }
 
-// EnsureRegistration is used to make sure a node, service, and check
-// registration is performed within a single transaction to avoid race
-// conditions on state updates.
+// EnsureRegistration 确保节点、服务和检查的注册
+// 在单个事务中执行以避免状态更新时的竞态条件
+// 这是服务注册流程的最终步骤，将数据持久化到状态存储
 func (s *Store) EnsureRegistration(idx uint64, req *structs.RegisterRequest) error {
+	// 开始写事务，idx 是 Raft 日志索引
 	tx := s.db.WriteTxn(idx)
-	defer tx.Abort()
+	defer tx.Abort() // 确保在出错时回滚事务
 
+	// 在事务中执行实际的注册逻辑
 	if err := s.ensureRegistrationTxn(tx, idx, false, req, false); err != nil {
 		return err
 	}
 
+	// 提交事务，原子性地应用所有更改
+	// 这是服务注册的最终确认步骤
 	return tx.Commit()
 }
 

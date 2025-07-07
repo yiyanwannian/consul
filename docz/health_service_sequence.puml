@@ -1,0 +1,157 @@
+@startuml Consul Health Service 查询时序图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam maxMessageSize 120
+
+title Consul Health Service 查询详细时序图\n代码位置标注版
+
+actor "客户端应用" as Client
+participant "Health API\n(api/health.go)" as HealthAPI
+participant "HTTP Client\n(api/api.go)" as HTTPClient
+participant "HTTP Request\n(request)" as Request
+participant "Consul Agent\nHTTP Server" as HTTPServer
+participant "Health Endpoint\n(agent/health_endpoint.go)" as HealthEndpoint
+participant "Health RPC\n(agent/consul/health_endpoint.go)" as HealthRPC
+participant "State Store\n(agent/consul/state)" as StateStore
+participant "ACL Filter" as ACLFilter
+
+== 第一阶段：客户端 API 调用 ==
+
+Client -> HealthAPI : health.Service("web", tags, true, queryOpts)
+note right of Client : 调用公共 API 方法\n**位置**: api/health.go:297
+
+HealthAPI -> HealthAPI : service(service, tags, passingOnly, q, "service")
+note right of HealthAPI : 调用内部通用方法\n**位置**: api/health.go:328
+
+== 第二阶段：HTTP 路径构建 ==
+
+HealthAPI -> HealthAPI : 确定请求路径
+note right of HealthAPI : **位置**: api/health.go:330-337\nswitch healthType {\ncase "service": "/v1/health/service/" + service\ncase "connect": "/v1/health/connect/" + service\ncase "ingress": "/v1/health/ingress/" + service\n}
+
+HealthAPI -> HTTPClient : newRequest("GET", path)
+note right of HealthAPI : **位置**: api/health.go:339\n创建 HTTP GET 请求对象
+
+HTTPClient -> Request : 创建 request 结构体
+note right of HTTPClient : **位置**: api/api.go:1053-1082\n设置 URL、方法、参数等
+
+== 第三阶段：请求参数设置 ==
+
+HealthAPI -> Request : setQueryOptions(q)
+note right of HealthAPI : **位置**: api/health.go:340\n设置查询选项
+
+Request -> Request : 设置查询参数
+note right of Request : **位置**: api/api.go:842-967\n- 数据中心 (dc)\n- 命名空间 (ns)\n- 分区 (partition)\n- ACL 令牌 (X-Consul-Token)\n- 等待时间 (wait)\n- 索引 (index)
+
+HealthAPI -> Request : 添加标签过滤参数
+note right of HealthAPI : **位置**: api/health.go:341-345\nfor _, tag := range tags {\n    r.params.Add("tag", tag)\n}
+
+HealthAPI -> Request : 设置健康状态过滤
+note right of HealthAPI : **位置**: api/health.go:346-348\nif passingOnly {\n    r.params.Set("passing", "1")\n}
+
+== 第四阶段：HTTP 请求执行 ==
+
+HealthAPI -> HTTPClient : doRequest(r)
+note right of HealthAPI : **位置**: api/health.go:349\n执行 HTTP 请求
+
+HTTPClient -> Request : toHTTP()
+note right of HTTPClient : **位置**: api/api.go:1085-1109\n转换为标准 HTTP 请求
+
+Request -> Request : 构建 HTTP 请求
+note right of Request : **位置**: api/api.go:998-1050\n- 编码查询参数\n- 设置请求头\n- 处理认证信息\n- 设置 Content-Type
+
+HTTPClient -> HTTPServer : HTTP GET 请求
+note right of HTTPClient : **位置**: api/api.go:1098\nresp, err := c.config.HttpClient.Do(req)
+
+== 第五阶段：服务端请求处理 ==
+
+HTTPServer -> HealthEndpoint : HealthServiceNodes(resp, req)
+note right of HTTPServer : **位置**: agent/health_endpoint.go:174-176\n路由到健康检查端点处理器
+
+HealthEndpoint -> HealthEndpoint : healthServiceNodes(resp, req, "service")
+note right of HealthEndpoint : **位置**: agent/health_endpoint.go:178\n通用健康服务节点处理方法
+
+HealthEndpoint -> HealthEndpoint : 解析请求参数
+note right of HealthEndpoint : **位置**: agent/health_endpoint.go:180-225\n- 解析企业版元数据\n- 解析数据中心和查询选项\n- 解析对等名称和相似组\n- 解析标签过滤参数\n- 解析服务名称
+
+HealthEndpoint -> HealthEndpoint : 构建 RPC 请求
+note right of HealthEndpoint : **位置**: agent/health_endpoint.go:226-250\nargs := structs.ServiceSpecificRequest{\n    ServiceName: serviceName,\n    ServiceTags: tags,\n    TagFilter: hasTagFilter,\n    QueryOptions: queryOpts\n}
+
+== 第六阶段：RPC 调用处理 ==
+
+HealthEndpoint -> HealthRPC : Health.ServiceNodes(args, reply)
+note right of HealthEndpoint : **位置**: agent/health_endpoint.go:251\n调用 RPC 方法
+
+HealthRPC -> HealthRPC : 请求转发检查
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:205\nif done, err := h.srv.ForwardRPC(...); done
+
+HealthRPC -> HealthRPC : 参数验证
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:209-237\n- 验证服务名称\n- 解析 ACL 令牌\n- 验证企业版请求\n- 检查 Connect/Ingress 权限
+
+HealthRPC -> HealthRPC : 确定查询函数
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:214-225\nswitch {\ncase args.Connect: serviceNodesConnect\ncase args.TagFilter: serviceNodesTagFilter\ncase args.Ingress: serviceNodesIngress\ndefault: serviceNodesDefault\n}
+
+== 第七阶段：状态存储查询 ==
+
+HealthRPC -> StateStore : blockingQuery(queryFunc)
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:252-352\n执行阻塞查询
+
+StateStore -> StateStore : CheckServiceNodes(ws, serviceName, entMeta, peerName)
+note right of StateStore : **位置**: agent/consul/health_endpoint.go:414-416\n从状态存储查询服务节点
+
+StateStore -> StateStore : 查询数据库
+note right of StateStore : 使用 memdb 查询\n- 服务实例信息\n- 节点信息\n- 健康检查状态
+
+StateStore --> HealthRPC : 返回服务节点列表
+note right of StateStore : structs.CheckServiceNodes\n包含节点、服务、检查信息
+
+== 第八阶段：结果过滤和处理 ==
+
+HealthRPC -> HealthRPC : 应用过滤器
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:325-341\n- bexpr 表达式过滤\n- 健康状态过滤 (passing only)\n- 标签过滤
+
+HealthRPC -> ACLFilter : filterACL(token, reply)
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:195-197\n应用 ACL 权限过滤
+
+ACLFilter -> ACLFilter : 检查权限
+note right of ACLFilter : 验证每个服务节点的\n读取权限
+
+ACLFilter --> HealthRPC : 过滤后的结果
+
+HealthRPC -> HealthRPC : 按距离排序
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:335-337\nsortNodesByDistanceFrom(args.Source, nodes)
+
+HealthRPC -> HealthRPC : 记录指标
+note right of HealthRPC : **位置**: agent/consul/health_endpoint.go:354-389\n记录查询指标和标签统计
+
+HealthRPC --> HealthEndpoint : 返回 RPC 响应
+note right of HealthRPC : reply.Nodes = filteredNodes\nreply.Index = lastModifyIndex
+
+== 第九阶段：HTTP 响应构建 ==
+
+HealthEndpoint -> HealthEndpoint : 构建 HTTP 响应
+note right of HealthEndpoint : **位置**: agent/health_endpoint.go:252-260\n- 设置响应头\n- 序列化 JSON 响应体
+
+HealthEndpoint --> HTTPServer : HTTP 200 + JSON 响应
+
+HTTPServer --> HTTPClient : HTTP 响应
+
+== 第十阶段：客户端响应处理 ==
+
+HTTPClient -> HTTPClient : 检查响应状态
+note right of HTTPClient : **位置**: api/health.go:354-356\nrequireOK(resp) // 要求 200 状态码
+
+HTTPClient -> HTTPClient : 解析查询元数据
+note right of HTTPClient : **位置**: api/health.go:358-360\nparseQueryMeta(resp, qm)\nqm.RequestTime = rtt
+
+HTTPClient -> HTTPClient : 解析响应体
+note right of HTTPClient : **位置**: api/health.go:362-365\ndecodeBody(resp, &out)\n// JSON 反序列化为 ServiceEntry 列表
+
+HTTPClient --> HealthAPI : 返回结果
+note right of HTTPClient : ([]*ServiceEntry, *QueryMeta, error)
+
+HealthAPI --> Client : 返回服务健康信息
+note right of HealthAPI : 包含节点、服务、检查状态的完整信息
+
+@enduml

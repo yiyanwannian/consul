@@ -1147,62 +1147,74 @@ func (s *HTTPHandlers) AgentHealthServiceByName(resp http.ResponseWriter, req *h
 	return result, CodeWithPayloadError{StatusCode: code, Reason: status, ContentType: "application/json"}
 }
 
+// AgentRegisterService 处理 HTTP PUT /v1/agent/service/register 请求
+// 这是服务注册流程的入口点，负责解析请求、验证参数并调用 Agent 进行服务注册
 func (s *HTTPHandlers) AgentRegisterService(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	// 创建服务定义结构体，用于存储解析后的服务配置
 	var args structs.ServiceDefinition
-	// Fixup the type decode of TTL or Interval if a check if provided.
+	// 修复 TTL 或 Interval 类型解码（如果提供了检查配置）
 
+	// 解析企业版元数据（分区、命名空间等），不允许通配符
 	if err := s.parseEntMetaNoWildcard(req, &args.EnterpriseMeta); err != nil {
 		return nil, err
 	}
 
+	// 解析 HTTP 请求体中的 JSON 数据到服务定义结构体
+	// 这里包含服务名称、端口、标签、健康检查等所有服务配置信息
 	if err := decodeBody(req.Body, &args); err != nil {
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Request decode failed: %v", err)}
 	}
 
-	// Verify the service has a name.
+	// 验证服务必须有名称，这是服务注册的基本要求
 	if args.Name == "" {
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: "Missing service name"}
 	}
 
-	// Check the service address here and in the catalog RPC endpoint
-	// since service registration isn't synchronous.
+	// 检查服务地址的有效性，在这里和 catalog RPC 端点都要检查
+	// 因为服务注册不是同步的，需要在多个层面进行验证
 	if ipaddr.IsAny(args.Address) {
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: "Invalid service address"}
 	}
 
+	// 声明 ACL 令牌变量，用于权限验证
 	var token string
+	// 从 HTTP 请求中解析 ACL 令牌（可能来自 Header 或 Query 参数）
 	s.parseToken(req, &token)
 
+	// 设置默认的企业版元数据分区为当前 Agent 的分区
 	s.defaultMetaPartitionToAgent(&args.EnterpriseMeta)
+	// 解析 ACL 令牌并获取授权器，同时设置默认的企业版元数据
 	authz, err := s.agent.delegate.ResolveTokenAndDefaultMeta(token, &args.EnterpriseMeta, nil)
 	if err != nil {
 		return nil, err
 	}
 
+	// 验证请求的分区是否有效（企业版功能）
 	if !s.validateRequestPartition(resp, &args.EnterpriseMeta) {
 		return nil, nil
 	}
 
-	// Get the node service.
+	// 从服务定义中获取节点服务对象，包含服务的所有配置信息
 	ns := args.NodeService()
 
-	// We currently do not persist locality inherited from the node service
-	// (it is inherited at runtime). See agent/proxycfg-sources/local/sync.go.
-	// To support locality-aware service discovery in the future, persisting
-	// this data may be necessary. This does not impact agent-less deployments
-	// because locality is explicitly set on service registration there.
+	// 我们目前不持久化从节点服务继承的位置信息（它在运行时继承）
+	// 参见 agent/proxycfg-sources/local/sync.go
+	// 为了在未来支持位置感知的服务发现，可能需要持久化这些数据
+	// 这不会影响无代理部署，因为在那里位置信息是在服务注册时显式设置的
 
+	// 验证服务权重配置（如果设置了权重）
 	if ns.Weights != nil {
 		if err := structs.ValidateWeights(ns.Weights); err != nil {
 			return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Invalid Weights: %v", err)}
 		}
 	}
+	// 验证服务元数据的有效性，检查键值对格式和内容
 	if err := structs.ValidateServiceMetadata(ns.Kind, ns.Meta, false); err != nil {
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Invalid Service Meta: %v", err)}
 	}
 
-	// Run validation. This same validation would happen on the catalog endpoint,
-	// so it helps ensure the sync will work properly.
+	// 运行完整的服务验证，这与 catalog 端点的验证相同
+	// 这有助于确保后续的同步过程能够正常工作
 	if err := ns.Validate(); err != nil {
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Validation failed: %v", err.Error())}
 	}
@@ -1231,67 +1243,76 @@ func (s *HTTPHandlers) AgentRegisterService(resp http.ResponseWriter, req *http.
 		}
 	}
 
-	// Get the provided token, if any, and vet against any ACL policies.
+	// 使用提供的 ACL 令牌验证服务注册权限
+	// 检查当前用户是否有权限在指定的命名空间和分区中注册此服务
 	if err := s.agent.vetServiceRegisterWithAuthorizer(authz, ns); err != nil {
 		return nil, err
 	}
 
-	// See if we have a sidecar to register too
+	// 检查是否需要同时注册 Sidecar 代理服务（用于 Consul Connect）
 	sidecar, sidecarChecks, sidecarToken, err := sidecarServiceFromNodeService(ns, token)
 	if err != nil {
 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Invalid SidecarService: %s", err)}
 	}
+	// 如果存在 Sidecar 服务配置，需要进行额外的验证和权限检查
 	if sidecar != nil {
+		// 验证 Sidecar 服务配置的有效性
 		if err := sidecar.ValidateForAgent(); err != nil {
 			return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: fmt.Sprintf("Failed Validation: %v", err.Error())}
 		}
-		// Make sure we are allowed to register the sidecar using the token
-		// specified (might be specific to sidecar or the same one as the overall
-		// request).
+		// 确保我们有权限使用指定的令牌注册 Sidecar 服务
+		// 令牌可能是 Sidecar 专用的，也可能与主服务使用相同的令牌
 		if err := s.agent.vetServiceRegister(sidecarToken, sidecar); err != nil {
 			return nil, err
 		}
-		// We parsed the sidecar registration, now remove it from the NodeService
-		// for the actual service since it's done it's job and we don't want to
-		// persist it in the actual state/catalog. SidecarService is meant to be a
-		// registration syntax sugar so don't propagate it any further.
+		// 我们已经解析了 Sidecar 注册信息，现在从 NodeService 中移除它
+		// 因为它已经完成了作用，我们不希望将其持久化到实际的状态/目录中
+		// SidecarService 只是一个注册语法糖，不应该进一步传播
 		ns.Connect.SidecarService = nil
 	}
 
-	// Add the service.
+	// 开始添加服务到 Agent
 	replaceExistingChecks := false
 
+	// 检查 URL 查询参数，确定是否要替换现有的健康检查
 	query := req.URL.Query()
 	if len(query["replace-existing-checks"]) > 0 && (query.Get("replace-existing-checks") == "" || query.Get("replace-existing-checks") == "true") {
 		replaceExistingChecks = true
 	}
 
+	// 构造添加服务的请求结构体
 	addReq := AddServiceRequest{
-		Service:               ns,
-		chkTypes:              chkTypes,
-		persist:               true,
-		token:                 token,
-		Source:                ConfigSourceRemote,
-		replaceExistingChecks: replaceExistingChecks,
+		Service:               ns,                    // 要注册的服务对象
+		chkTypes:              chkTypes,              // 健康检查类型列表
+		persist:               true,                  // 是否持久化服务配置到磁盘
+		token:                 token,                 // ACL 令牌
+		Source:                ConfigSourceRemote,    // 配置来源标记为远程（HTTP API）
+		replaceExistingChecks: replaceExistingChecks, // 是否替换现有的健康检查
 	}
+	// 调用 Agent 的 AddService 方法实际添加服务到本地状态
 	if err := s.agent.AddService(addReq); err != nil {
 		return nil, err
 	}
 
+	// 如果存在 Sidecar 服务，也需要将其添加到 Agent
 	if sidecar != nil {
+		// 构造 Sidecar 服务的添加请求
 		addReq := AddServiceRequest{
-			Service:               sidecar,
-			chkTypes:              sidecarChecks,
-			persist:               true,
-			token:                 sidecarToken,
-			Source:                ConfigSourceRemote,
-			replaceExistingChecks: replaceExistingChecks,
+			Service:               sidecar,              // Sidecar 代理服务对象
+			chkTypes:              sidecarChecks,        // Sidecar 的健康检查类型
+			persist:               true,                 // 持久化 Sidecar 配置
+			token:                 sidecarToken,         // Sidecar 专用的 ACL 令牌
+			Source:                ConfigSourceRemote,   // 配置来源为远程
+			replaceExistingChecks: replaceExistingChecks, // 检查替换策略
 		}
+		// 添加 Sidecar 服务到 Agent
 		if err := s.agent.AddService(addReq); err != nil {
 			return nil, err
 		}
 	}
+	// 触发状态同步，将本地状态的变更同步到集群
 	s.syncChanges()
+	// 返回成功响应（HTTP 200 OK）
 	return nil, nil
 }
 

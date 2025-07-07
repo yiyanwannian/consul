@@ -270,47 +270,52 @@ func (l *State) aclTokenForServiceSync(id structs.ServiceID, fallbacks ...func()
 	return ""
 }
 
+// addServiceLocked 在持有锁的情况下添加服务到本地状态
 func (l *State) addServiceLocked(service *structs.NodeService, token string, isLocal bool) error {
 	if service == nil {
 		return fmt.Errorf("no service")
 	}
 
-	// Avoid having the stored service have any call-site ownership.
+	// 避免存储的服务对象被调用方持有引用，进行深拷贝
 	var err error
 	service, err = cloneService(service)
 	if err != nil {
 		return err
 	}
 
-	// use the service name as id if the id was omitted
+	// 如果服务 ID 为空，使用服务名称作为 ID
 	if service.ID == "" {
 		service.ID = service.Service
 	}
 
+	// 验证服务的分区与 Agent 的分区是否匹配（企业版功能）
 	if l.agentEnterpriseMeta.PartitionOrDefault() != service.PartitionOrDefault() {
 		return fmt.Errorf("cannot add service ID %q to node in partition %q", service.CompoundServiceID(), l.config.Partition)
 	}
 
+	// 设置服务状态，这会将服务标记为需要同步（InSync = false）
 	l.setServiceStateLocked(&ServiceState{
-		Service:          service,
-		Token:            token,
-		IsLocallyDefined: isLocal,
+		Service:          service,          // 服务定义
+		Token:            token,            // ACL 令牌
+		IsLocallyDefined: isLocal,          // 是否为本地定义的服务
 	})
 	return nil
 }
 
-// AddServiceWithChecks adds a service entry and its checks to the local state
-// atomically This entry is persistent and the agent will make a best effort to
-// ensure it is registered. The isLocallyDefined parameter indicates whether
-// the service and checks are sourced from local agent configuration files.
+// AddServiceWithChecks 原子性地将服务条目及其检查添加到本地状态
+// 此条目是持久的，Agent 将尽最大努力确保其被注册到集群
+// isLocallyDefined 参数指示服务和检查是否来源于本地 Agent 配置文件
 func (l *State) AddServiceWithChecks(service *structs.NodeService, checks []*structs.HealthCheck, token string, isLocallyDefined bool) error {
+	// 获取状态锁，确保原子性操作
 	l.Lock()
 	defer l.Unlock()
 
+	// 首先添加服务到本地状态，这会标记服务为需要同步
 	if err := l.addServiceLocked(service, token, isLocallyDefined); err != nil {
 		return err
 	}
 
+	// 然后添加所有相关的健康检查
 	for _, check := range checks {
 		if err := l.addCheckLocked(check, token, isLocallyDefined); err != nil {
 			return err
@@ -471,25 +476,33 @@ func (l *State) SetServiceState(s *ServiceState) {
 	l.setServiceStateLocked(s)
 }
 
+// setServiceStateLocked 设置服务状态并触发同步
 func (l *State) setServiceStateLocked(s *ServiceState) {
 	key := s.Service.CompoundServiceID()
 	old, hasOld := l.services[key]
+	// 如果服务已存在，检查新服务定义是否与旧的相同
+	// 如果相同则标记为已同步，否则标记为需要同步
 	if hasOld {
 		s.InSync = s.Service.IsSame(old.Service)
 	}
+	// 将服务状态存储到本地状态映射中
 	l.services[key] = s
 
+	// 创建新的监视通道，用于通知服务状态变更
 	s.WatchCh = make(chan struct{}, 1)
 	if hasOld && old.WatchCh != nil {
 		close(old.WatchCh)
 	}
+	// 如果是新服务，通知相关的别名检查
 	if !hasOld {
-		// The status of an alias check is updated if the alias service is added/removed
-		// Only try notify alias checks if service didn't already exist (!hasOld)
+		// 别名检查的状态会在别名服务添加/移除时更新
+		// 只有在服务之前不存在时才尝试通知别名检查
 		l.notifyIfAliased(key)
 	}
 
+	// 关键步骤：触发状态同步变更，这会启动 Anti-Entropy 同步过程
 	l.TriggerSyncChanges()
+	// 广播状态更新给所有监听者
 	l.broadcastUpdateLocked()
 }
 
@@ -1240,33 +1253,36 @@ func (l *State) SyncFull() error {
 	return l.SyncChanges()
 }
 
-// SyncChanges pushes checks, services and node info data which has been
-// marked out of sync or deleted to the server.
+// SyncChanges 将标记为未同步或已删除的检查、服务和节点信息推送到服务器
+// 这是 Anti-Entropy 机制的核心方法，实现本地状态与集群状态的同步
 func (l *State) SyncChanges() error {
 	l.Lock()
 	defer l.Unlock()
 
-	// Sync the node level info if we need to.
-	// At the start to guarantee sync even if services or checks fail,
-	// which is more likely because there are more syncs happening for them.
+	// 首先同步节点级别的信息
+	// 在开始时进行同步以保证即使服务或检查失败也能同步节点信息
+	// 这更有可能发生，因为有更多的同步操作针对服务和检查
 
 	if l.nodeInfoInSync {
 		l.logger.Debug("Node info in sync")
 	} else {
+		// 同步节点信息到集群
 		if err := l.syncNodeInfo(); err != nil {
 			return err
 		}
 	}
 
 	var errs error
-	// Sync the services
-	// (logging happens in the helper methods)
+	// 同步所有服务
+	// （日志记录在辅助方法中进行）
 	for id, s := range l.services {
 		var err error
 		switch {
 		case s.Deleted:
+			// 如果服务被标记为删除，从集群中删除
 			err = l.deleteService(id)
 		case !s.InSync:
+			// 如果服务未同步，将其同步到集群
 			err = l.syncService(id)
 		default:
 			l.logger.Debug("Service in sync", "service", id.String())
@@ -1430,58 +1446,64 @@ func (l *State) checkRegistrationTokenFallback(key structs.CheckID) func() strin
 	}
 }
 
-// syncService is used to sync a service to the server
+// syncService 用于将服务同步到服务器
+// 这是本地状态同步到集群的关键方法，通过 RPC 调用 Catalog.Register
 func (l *State) syncService(key structs.ServiceID) error {
+	// 获取服务同步使用的 ACL 令牌
 	st := l.aclTokenForServiceSync(key, l.serviceRegistrationTokenFallback(key), l.tokens.UserToken)
 
-	// If the service has associated checks that are out of sync,
-	// piggyback them on the service sync so they are part of the
-	// same transaction and are registered atomically. We only let
-	// checks ride on service registrations with the same token,
-	// otherwise we need to register them separately so they don't
-	// pick up privileges from the service token.
+	// 如果服务有关联的未同步检查，将它们搭载在服务同步上
+	// 这样它们就是同一个事务的一部分，可以原子性地注册
+	// 我们只允许使用相同令牌的检查搭载在服务注册上
+	// 否则需要单独注册它们，以免从服务令牌获得权限
 	var checks structs.HealthChecks
 	for checkKey, c := range l.checks {
+		// 跳过已删除或已同步的检查
 		if c.Deleted || c.InSync {
 			continue
 		}
+		// 检查是否属于当前服务
 		if !key.Matches(c.Check.CompoundServiceID()) {
 			continue
 		}
+		// 检查令牌是否与服务令牌相同
 		if st != l.aclTokenForCheckSync(checkKey, l.checkRegistrationTokenFallback(checkKey), l.tokens.UserToken) {
 			continue
 		}
 		checks = append(checks, c.Check)
 	}
 
+	// 构造注册请求，包含节点、服务和检查信息
 	req := structs.RegisterRequest{
-		Datacenter:      l.config.Datacenter,
-		ID:              l.config.NodeID,
-		Node:            l.config.NodeName,
-		Address:         l.config.AdvertiseAddr,
-		TaggedAddresses: l.config.TaggedAddresses,
-		NodeMeta:        l.metadata,
-		Service:         l.services[key].Service,
-		EnterpriseMeta:  key.EnterpriseMeta,
-		WriteRequest:    structs.WriteRequest{Token: st},
-		SkipNodeUpdate:  l.nodeInfoInSync,
+		Datacenter:      l.config.Datacenter,        // 数据中心名称
+		ID:              l.config.NodeID,            // 节点 ID
+		Node:            l.config.NodeName,          // 节点名称
+		Address:         l.config.AdvertiseAddr,     // 节点广播地址
+		TaggedAddresses: l.config.TaggedAddresses,   // 标记地址（LAN/WAN）
+		NodeMeta:        l.metadata,                 // 节点元数据
+		Service:         l.services[key].Service,    // 要注册的服务
+		EnterpriseMeta:  key.EnterpriseMeta,         // 企业版元数据
+		WriteRequest:    structs.WriteRequest{Token: st}, // ACL 令牌
+		SkipNodeUpdate:  l.nodeInfoInSync,           // 如果节点信息已同步则跳过节点更新
 	}
 
-	// Backwards-compatibility for Consul < 0.5
+	// 向后兼容 Consul < 0.5 版本
 	if len(checks) == 1 {
 		req.Check = checks[0]
 	} else {
 		req.Checks = checks
 	}
 
+	// 执行 RPC 调用，将注册请求发送到 Catalog 服务
 	var out struct{}
 	err := l.Delegate.RPC(context.Background(), "Catalog.Register", &req, &out)
 	switch {
 	case err == nil:
+		// 注册成功，标记服务为已同步
 		l.services[key].InSync = true
-		// Given how the register API works, this info is also updated
-		// every time we sync a service.
+		// 由于注册 API 的工作方式，每次同步服务时节点信息也会更新
 		l.nodeInfoInSync = true
+		// 标记所有搭载的检查为已同步
 		for _, check := range checks {
 			checkKey := structs.NewCheckID(check.CheckID, &check.EnterpriseMeta)
 			l.checks[checkKey].InSync = true
@@ -1490,8 +1512,9 @@ func (l *State) syncService(key structs.ServiceID) error {
 		return nil
 
 	case acl.IsErrPermissionDenied(err), acl.IsErrNotFound(err):
-		// todo(fs): mark the service and the checks to be in sync to prevent excessive retrying before next full sync
-		// todo(fs): some backoff strategy might be a better solution
+		// ACL 权限被拒绝或令牌未找到的情况
+		// TODO: 标记服务和检查为已同步以防止在下次完整同步前过度重试
+		// TODO: 某种退避策略可能是更好的解决方案
 		l.services[key].InSync = true
 		for _, check := range checks {
 			checkKey := structs.NewCheckID(check.CheckID, &check.EnterpriseMeta)

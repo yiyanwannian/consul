@@ -837,98 +837,121 @@ type request struct {
 	ctx    context.Context
 }
 
-// setQueryOptions is used to annotate the request with
-// additional query options
+// setQueryOptions 用于为请求添加额外的查询选项
+// 这些选项控制查询行为，如一致性、缓存、过滤等
 func (r *request) setQueryOptions(q *QueryOptions) {
+	// 如果查询选项为空，直接返回
 	if q == nil {
 		return
 	}
+	// 设置命名空间参数（企业版功能）
 	if q.Namespace != "" {
-		// For backwards-compatibility with existing tests,
-		// use the short-hand query param name "ns"
-		// rather than the alternative long-hand "namespace"
+		// 为了与现有测试的向后兼容性，使用简写查询参数名 "ns"
+		// 而不是替代的长格式 "namespace"
 		r.params.Set("ns", q.Namespace)
 	}
+	// 设置分区参数（企业版功能）
 	if q.Partition != "" {
-		// For backwards-compatibility with existing tests,
-		// use the long-hand query param name "partition"
-		// rather than the alternative short-hand "ap"
+		// 为了与现有测试的向后兼容性，使用长格式查询参数名 "partition"
+		// 而不是替代的简写 "ap"
 		r.params.Set("partition", q.Partition)
 	}
+	// 设置相似组参数（企业版功能，用于故障转移）
 	if q.SamenessGroup != "" {
-		// For backwards-compatibility with existing tests,
-		// use the long-hand query param name "sameness-group"
-		// rather than the alternative short-hand "sg"
+		// 为了与现有测试的向后兼容性，使用长格式查询参数名 "sameness-group"
+		// 而不是替代的简写 "sg"
 		r.params.Set("sameness-group", q.SamenessGroup)
 	}
+	// 设置数据中心参数
 	if q.Datacenter != "" {
-		// For backwards-compatibility with existing tests,
-		// use the short-hand query param name "dc"
-		// rather than the alternative long-hand "datacenter"
+		// 为了与现有测试的向后兼容性，使用简写查询参数名 "dc"
+		// 而不是替代的长格式 "datacenter"
 		r.params.Set("dc", q.Datacenter)
 	}
+	// 设置对等节点参数（用于集群对等连接）
 	if q.Peer != "" {
 		r.params.Set("peer", q.Peer)
 	}
+	// 允许从 Follower 节点读取过期数据（最终一致性）
 	if q.AllowStale {
 		r.params.Set("stale", "")
 	}
+	// 要求强一致性读取（必须从 Leader 读取）
 	if q.RequireConsistent {
 		r.params.Set("consistent", "")
 	}
+	// 设置等待索引，用于阻塞查询（长轮询）
 	if q.WaitIndex != 0 {
 		r.params.Set("index", strconv.FormatUint(q.WaitIndex, 10))
 	}
+	// 设置等待时间，阻塞查询的最大等待时长
 	if q.WaitTime != 0 {
 		r.params.Set("wait", durToMsec(q.WaitTime))
 	}
+	// 设置等待哈希，用于基于内容哈希的阻塞查询
 	if q.WaitHash != "" {
 		r.params.Set("hash", q.WaitHash)
 	}
+	// 设置 ACL 令牌到请求头中
 	if q.Token != "" {
 		r.header.Set("X-Consul-Token", q.Token)
 	}
+	// 设置就近节点参数，用于按网络距离排序结果
 	if q.Near != "" {
 		r.params.Set("near", q.Near)
 	}
+	// 设置过滤表达式，用于服务端结果过滤
 	if q.Filter != "" {
 		r.params.Set("filter", q.Filter)
 	}
+	// 添加节点元数据过滤条件
 	if len(q.NodeMeta) > 0 {
 		for key, value := range q.NodeMeta {
+			// 每个节点元数据以 "key:value" 格式添加
 			r.params.Add("node-meta", key+":"+value)
 		}
 	}
+	// 设置中继因子，用于网络坐标计算
 	if q.RelayFactor != 0 {
 		r.params.Set("relay-factor", strconv.Itoa(int(q.RelayFactor)))
 	}
+	// 设置仅本地查询标志
 	if q.LocalOnly {
 		r.params.Set("local-only", fmt.Sprintf("%t", q.LocalOnly))
 	}
+	// 设置 Connect 查询标志
 	if q.Connect {
 		r.params.Set("connect", "true")
 	}
+	// 启用客户端缓存（不能与强一致性同时使用）
 	if q.UseCache && !q.RequireConsistent {
 		r.params.Set("cached", "")
 
+		// 构建缓存控制头
 		cc := []string{}
+		// 设置最大缓存时间
 		if q.MaxAge > 0 {
 			cc = append(cc, fmt.Sprintf("max-age=%.0f", q.MaxAge.Seconds()))
 		}
+		// 设置错误时的过期容忍时间
 		if q.StaleIfError > 0 {
 			cc = append(cc, fmt.Sprintf("stale-if-error=%.0f", q.StaleIfError.Seconds()))
 		}
+		// 如果有缓存控制指令，添加到请求头
 		if len(cc) > 0 {
 			r.header.Set("Cache-Control", strings.Join(cc, ", "))
 		}
 	}
+	// 合并中央配置标志
 	if q.MergeCentralConfig {
 		r.params.Set("merge-central-config", "")
 	}
+	// 全局查询标志
 	if q.Global {
 		r.params.Set("global", "")
 	}
 
+	// 设置请求上下文，用于取消和超时控制
 	r.ctx = q.ctx
 }
 
@@ -1049,62 +1072,78 @@ func (r *request) toHTTP() (*http.Request, error) {
 	return req, nil
 }
 
-// newRequest is used to create a new request
+// newRequest 用于创建新的 HTTP 请求对象
 func (c *Client) newRequest(method, path string) *request {
+	// 创建请求结构体，包含所有必要的请求信息
 	r := &request{
-		config: &c.config,
-		method: method,
+		config: &c.config,    // 客户端配置引用
+		method: method,       // HTTP 方法（GET、POST 等）
 		url: &url.URL{
-			Scheme: c.config.Scheme,
-			Host:   c.config.Address,
-			Path:   c.config.PathPrefix + path,
+			Scheme: c.config.Scheme,                    // 协议（http 或 https）
+			Host:   c.config.Address,                   // Consul 服务器地址
+			Path:   c.config.PathPrefix + path,         // 完整的 API 路径
 		},
-		params: make(map[string][]string),
-		header: c.Headers(),
+		params: make(map[string][]string),              // 查询参数映射
+		header: c.Headers(),                            // 复制客户端默认请求头
 	}
 
+	// 如果配置了数据中心，添加 dc 查询参数
 	if c.config.Datacenter != "" {
 		r.params.Set("dc", c.config.Datacenter)
 	}
+	// 如果配置了命名空间，添加 ns 查询参数（企业版功能）
 	if c.config.Namespace != "" {
 		r.params.Set("ns", c.config.Namespace)
 	}
+	// 如果配置了分区，添加 partition 查询参数（企业版功能）
 	if c.config.Partition != "" {
 		r.params.Set("partition", c.config.Partition)
 	}
+	// 如果配置了等待时间，添加 wait 查询参数（用于阻塞查询）
 	if c.config.WaitTime != 0 {
 		r.params.Set("wait", durToMsec(r.config.WaitTime))
 	}
+	// 如果配置了 ACL 令牌，添加到请求头中
 	if c.config.Token != "" {
 		r.header.Set("X-Consul-Token", r.config.Token)
 	}
+	// 返回构建完成的请求对象
 	return r
 }
 
-// doRequest runs a request with our client
+// doRequest 使用客户端执行 HTTP 请求
 func (c *Client) doRequest(r *request) (time.Duration, *http.Response, error) {
+	// 将内部请求对象转换为标准的 HTTP 请求
 	req, err := r.toHTTP()
 	if err != nil {
 		return 0, nil, err
 	}
 
+	// 获取请求的内容类型
 	contentType := GetContentType(req)
 
+	// 设置请求的 Content-Type 头
 	if req != nil {
 		req.Header.Set(contentTypeHeader, contentType)
 	}
 
+	// 记录请求开始时间，用于计算往返时间
 	start := time.Now()
+	// 使用配置的 HTTP 客户端执行请求
 	resp, err := c.config.HttpClient.Do(req)
 
+	// 如果收到响应，确保响应头包含正确的 Content-Type
 	if resp != nil {
 		respContentType := resp.Header.Get(contentTypeHeader)
+		// 如果响应没有 Content-Type 或与请求不匹配，设置为请求的类型
 		if respContentType == "" || respContentType != contentType {
 			resp.Header.Set(contentTypeHeader, contentType)
 		}
 	}
 
+	// 计算请求往返时间
 	diff := time.Since(start)
+	// 返回往返时间、HTTP 响应和错误
 	return diff, resp, err
 }
 

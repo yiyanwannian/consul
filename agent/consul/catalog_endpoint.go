@@ -102,79 +102,92 @@ func hasPeerNameInRequest(req *structs.RegisterRequest) bool {
 	return false
 }
 
-// Register a service and/or check(s) in a node, creating the node if it doesn't exist.
-// It is valid to pass no service or checks to simply create the node itself.
+// Register 在节点中注册服务和/或检查，如果节点不存在则创建节点
+// 传递没有服务或检查来简单创建节点本身也是有效的
 func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error {
+	// 检查是否允许对等注册（企业版功能）
 	if !c.srv.config.PeeringTestAllowPeerRegistrations && hasPeerNameInRequest(args) {
 		return fmt.Errorf("cannot register requests with PeerName in them")
 	}
 
+	// 如果当前节点不是 Leader，将请求转发到 Leader 节点
+	// 这确保了所有写操作都在 Leader 上执行，维护数据一致性
 	if done, err := c.srv.ForwardRPC("Catalog.Register", args, reply); done {
 		return err
 	}
+	// 记录注册操作的性能指标
 	defer metrics.MeasureSince([]string{"catalog", "register"}, time.Now())
 
-	// Fetch the ACL token, if any.
+	// 获取并验证 ACL 令牌，解析权限
 	authz, err := c.srv.ResolveTokenAndDefaultMeta(args.Token, &args.EnterpriseMeta, nil)
 	if err != nil {
 		return err
 	}
 
+	// 验证企业版请求的有效性（分区、命名空间等）
 	if err := c.srv.validateEnterpriseRequest(args.GetEnterpriseMeta(), true); err != nil {
 		return err
 	}
 
-	// This needs to happen before the other preapply checks as it will fixup some of the
-	// internal enterprise metas on the services and checks
+	// 这需要在其他预应用检查之前进行，因为它会修复
+	// 服务和检查上的一些内部企业版元数据
 	state := c.srv.fsm.State()
 	entMeta, err := state.ValidateRegisterRequest(args)
 	if err != nil {
 		return err
 	}
 
-	// Verify the args.
+	// 验证注册请求的参数
+	// 验证节点名称和 ID 的有效性
 	if err := nodePreApply(args.Node, string(args.ID)); err != nil {
 		return err
 	}
+	// 如果不跳过节点更新，必须提供节点地址
 	if args.Address == "" && !args.SkipNodeUpdate {
 		return fmt.Errorf("Must provide address if SkipNodeUpdate is not set")
 	}
 
-	// Handle a service registration.
+	// 处理服务注册
 	if args.Service != nil {
+		// 对服务进行预处理验证，包括 ACL 权限检查
 		if err := servicePreApply(args.Service, authz, args.Service.FillAuthzContext); err != nil {
 			return err
 		}
 	}
 
-	// Move the old format single check into the slice, and fixup IDs.
+	// 将旧格式的单个检查移动到检查切片中，并修复 ID
 	if args.Check != nil {
 		args.Checks = append(args.Checks, args.Check)
 		args.Check = nil
 	}
+	// 处理所有健康检查
 	for _, check := range args.Checks {
+		// 如果检查没有指定节点，使用注册请求的节点
 		if check.Node == "" {
 			check.Node = args.Node
 		}
+		// 对检查进行预处理
 		checkPreApply(check)
 
-		// Populate check type for cases when a check is registered in the catalog directly
-		// and not via anti-entropy
+		// 为直接在目录中注册而不是通过 anti-entropy 注册的检查填充检查类型
 		if check.Type == "" {
 			chkType := check.CheckType()
 			check.Type = chkType.Type()
 		}
 	}
 
-	// Check the complete register request against the given ACL policy.
+	// 根据给定的 ACL 策略检查完整的注册请求
 	_, ns, err := state.NodeServices(nil, args.Node, entMeta, args.PeerName)
 	if err != nil {
 		return fmt.Errorf("Node lookup failed: %v", err)
 	}
+	// 验证注册请求是否符合 ACL 权限要求
 	if err := vetRegisterWithACL(authz, args, ns); err != nil {
 		return err
 	}
 
+	// 关键步骤：通过 Raft 共识机制应用注册请求
+	// 这会将注册请求复制到集群中的所有节点，确保数据一致性
 	_, err = c.srv.raftApply(structs.RegisterRequestType, args)
 	return err
 }
