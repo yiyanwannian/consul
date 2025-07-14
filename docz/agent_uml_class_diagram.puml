@@ -1,0 +1,319 @@
+@startuml Agent 类图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam classAttributeIconSize 0
+skinparam classFontSize 10
+skinparam packageStyle rectangle
+skinparam roundcorner 5
+
+title Consul Agent 核心类图
+
+package "Agent 核心" as agent_core {
+    class Agent {
+        - baseDeps: BaseDeps
+        - config: *config.RuntimeConfig
+        - logger: hclog.InterceptLogger
+        - delegate: delegate
+        - externalGRPCServer: *grpc.Server
+        - State: *local.State
+        - sync: *ae.StateSyncer
+        - cache: *cache.Cache
+        - leafCertManager: *leafcert.Manager
+        - checkReapAfter: map[structs.CheckID]time.Duration
+        - checkMonitors: map[structs.CheckID]*checks.CheckMonitor
+        - checkHTTPs: map[structs.CheckID]*checks.CheckHTTP
+        - checkTCPs: map[structs.CheckID]*checks.CheckTCP
+        - checkTTLs: map[structs.CheckID]*checks.CheckTTL
+        - checkAliases: map[structs.CheckID]*checks.CheckAlias
+        - stateLock: *mutex.Mutex
+        - tokens: *token.Store
+        - proxyConfig: *proxycfg.Manager
+        - serviceManager: *ServiceManager
+        - tlsConfigurator: *tlsutil.Configurator
+        - httpHandlers: *HTTPHandlers
+        - routineManager: *routine.Manager
+        - xdsServer: *xds.Server
+        --
+        + New(bd BaseDeps): (*Agent, error)
+        + Start(ctx context.Context): error
+        + Leave(): error
+        + Shutdown(): error
+        + AddService(req AddServiceRequest): error
+        + RemoveService(serviceID structs.ServiceID): error
+        + AddCheck(check *structs.HealthCheck): error
+        + RemoveCheck(checkID structs.CheckID): error
+        + ReloadConfig(newCfg *config.RuntimeConfig): error
+        + RPC(ctx context.Context, method string, args, reply interface{}): error
+    }
+    
+    class BaseDeps {
+        + consul.Deps
+        + RuntimeConfig: *config.RuntimeConfig
+        + MetricsConfig: *lib.MetricsConfig
+        + AutoConfig: *autoconf.AutoConfig
+        + Cache: *cache.Cache
+        + LeafCertManager: *leafcert.Manager
+        + ViewStore: *submatview.Store
+        + WatchedFiles: []string
+        + NetRPC: *LazyNetRPC
+        --
+        + Close(): void
+    }
+    
+    interface delegate {
+        + Leave(): error
+        + AgentLocalMember(): serf.Member
+        + LANMembersInAgentPartition(): []serf.Member
+        + LANMembers(f consul.LANMemberFilter): ([]serf.Member, error)
+        + GetLANCoordinate(): (librtt.CoordinateSet, error)
+        + JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta): (int, error)
+        + RemoveFailedNode(node string, prune bool, entMeta *acl.EnterpriseMeta): error
+        + ResolveTokenAndDefaultMeta(token string, entMeta *acl.EnterpriseMeta, authzContext *acl.AuthorizerContext): (resolver.Result, error)
+        + RPC(ctx context.Context, method string, args, reply interface{}): error
+        + ResourceServiceClient(): pbresource.ResourceServiceClient
+        + SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.Writer, replyFn structs.SnapshotReplyFn): error
+        + Shutdown(): error
+        + Stats(): map[string]map[string]string
+        + ReloadConfig(config consul.ReloadableConfig): error
+    }
+}
+
+package "本地状态管理" as local_state {
+    class "local.State" as LocalState {
+        - sync.RWMutex
+        - Delegate: rpc
+        - TriggerSyncChanges: func()
+        - logger: hclog.Logger
+        - config: Config
+        - agentEnterpriseMeta: acl.EnterpriseMeta
+        - nodeInfoInSync: bool
+        - services: map[structs.ServiceID]*ServiceState
+        - checks: map[structs.CheckID]*CheckState
+        - checkAliases: map[structs.ServiceID]map[structs.CheckID]chan<- struct{}
+        - metadata: map[string]string
+        - tokens: *token.Store
+        --
+        + NewState(c Config, logger hclog.Logger, tokens *token.Store): *State
+        + AddService(service *structs.NodeService, token string): error
+        + RemoveService(id structs.ServiceID): error
+        + AddCheck(check *structs.HealthCheck, token string): error
+        + RemoveCheck(id structs.CheckID): error
+        + UpdateCheck(id structs.CheckID, status, output string): void
+        + Services(): map[structs.ServiceID]*structs.NodeService
+        + Checks(): map[structs.CheckID]*structs.HealthCheck
+        + SyncFull(): error
+        + SyncChanges(): error
+    }
+    
+    class "ae.StateSyncer" as StateSyncer {
+        - State: SyncState
+        - Interval: time.Duration
+        - ShutdownCh: chan struct{}
+        - Logger: hclog.Logger
+        - SyncFull: *Trigger
+        - SyncChanges: *Trigger
+        --
+        + NewStateSyncer(state SyncState, intv time.Duration, shutdownCh chan struct{}, logger hclog.Logger): *StateSyncer
+        + Run(): void
+        + Pause(): void
+        + Resume(): void
+        + SyncChangesEvent(): void
+        + SyncFullEvent(): void
+    }
+}
+
+package "HTTP 服务" as http_service {
+    class HTTPHandlers {
+        - agent: *Agent
+        - denylist: *Denylist
+        - configReloaders: []ConfigReloader
+        - h: http.Handler
+        - metricsProxyCfg: atomic.Value
+        - proxyTransport: http.RoundTripper
+        --
+        + NewHTTPHandlers(agent *Agent, denylist *Denylist): *HTTPHandlers
+        + ReloadConfig(newCfg *config.RuntimeConfig): error
+        + AgentRegisterService(resp http.ResponseWriter, req *http.Request): (interface{}, error)
+        + AgentDeregisterService(resp http.ResponseWriter, req *http.Request): (interface{}, error)
+        + CatalogRegister(resp http.ResponseWriter, req *http.Request): (interface{}, error)
+        + HealthServiceNodes(resp http.ResponseWriter, req *http.Request): (interface{}, error)
+    }
+    
+    interface dnsServer {
+        + GetAddr(): string
+        + ListenAndServe(string, string, func()): error
+        + ReloadConfig(*config.RuntimeConfig): error
+        + Shutdown(): void
+    }
+}
+
+package "健康检查" as health_checks {
+    abstract class CheckBase {
+        # CheckID: structs.CheckID
+        # ServiceID: structs.ServiceID
+        # Interval: time.Duration
+        # Timeout: time.Duration
+        # Logger: hclog.Logger
+        # OutputMaxSize: int
+        # StatusHandler: *StatusHandler
+        # stop: bool
+        # stopCh: chan struct{}
+        # stopLock: sync.Mutex
+        # stopWg: sync.WaitGroup
+        --
+        + Start(): void
+        + Stop(): void
+        + CheckType(): structs.CheckType
+    }
+    
+    class "checks.CheckHTTP" as CheckHTTP {
+        - HTTP: string
+        - Header: map[string][]string
+        - Method: string
+        - Body: string
+        - TLSClientConfig: *tls.Config
+        - DisableRedirects: bool
+        - httpClient: *http.Client
+        - ProxyHTTP: string
+        --
+        + NewCheckHTTP(checkID structs.CheckID, http string, header map[string][]string, method string, body string, disableRedirects bool, interval time.Duration, timeout time.Duration, logger hclog.Logger, tlsClientConfig *tls.Config): *CheckHTTP
+        + Start(): void
+        + Stop(): void
+        + check(): void
+    }
+    
+    class "checks.CheckTCP" as CheckTCP {
+        - TCP: string
+        --
+        + NewCheckTCP(checkID structs.CheckID, tcp string, interval time.Duration, timeout time.Duration, logger hclog.Logger): *CheckTCP
+    }
+    
+    class "checks.CheckTTL" as CheckTTL {
+        - ttl: time.Duration
+        - timer: *time.Timer
+        --
+        + NewCheckTTL(checkID structs.CheckID, ttl time.Duration, logger hclog.Logger): *CheckTTL
+        + SetStatus(status, output string): void
+    }
+    
+    class "checks.CheckAlias" as CheckAlias {
+        - AliasNode: string
+        - AliasService: string
+        - Notify: func()
+        --
+        + NewCheckAlias(checkID structs.CheckID, aliasNode, aliasService string, logger hclog.Logger): *CheckAlias
+    }
+}
+
+package "服务管理" as service_mgmt {
+    class ServiceManager {
+        - agent: *Agent
+        - servicesLock: sync.Mutex
+        - services: map[structs.ServiceID]*serviceConfigWatch
+        - ctx: context.Context
+        - cancel: context.CancelFunc
+        - running: sync.WaitGroup
+        --
+        + NewServiceManager(agent *Agent): *ServiceManager
+        + AddService(req addServiceLockedRequest): error
+        + RemoveService(id structs.ServiceID): void
+        + Stop(): void
+    }
+}
+
+package "缓存系统" as cache_system {
+    class "cache.Cache" as Cache {
+        - types: map[string]typeEntry
+        - entries: map[string]cacheEntry
+        - entriesExpiryHeap: *ttlcache.ExpiryHeap
+        - fetchHandles: map[string]fetchHandle
+        - stopCh: chan struct{}
+        - options: Options
+        --
+        + New(options Options): *Cache
+        + Get(ctx context.Context, t string, r Request): (interface{}, ResultMeta, error)
+        + Notify(ctx context.Context, t string, r Request, correlationID string, ch chan<- UpdateEvent): error
+        + Prepopulate(t string, result FetchResult, dc string, token string, key string): error
+        + RegisterType(n string, typ Type): void
+    }
+}
+
+package "代理配置" as proxy_config {
+    class "proxycfg.Manager" as ProxyManager {
+        - logger: hclog.Logger
+        - source: proxycfg.ConfigSource
+        - cache: *cache.Cache
+        - health: Health
+        - intentionDefaultAllow: bool
+        - kin: *proxycfg.Kind
+        --
+        + NewManager(cfg ManagerConfig): (*Manager, error)
+        + Watch(req ProxyID): (<-chan *ConfigSnapshot, proxycfg.CancelFunc)
+        + Close(): void
+    }
+}
+
+package "Consul 核心" as consul_core {
+    class "consul.Server" as ConsulServer {
+        - config: *Config
+        - logger: hclog.InterceptLogger
+        - raft: *raft.Raft
+        - fsm: *fsm.FSM
+        - rpcServer: *rpc.Server
+        - grpcHandler: *grpc.Server
+        - router: *router.Router
+        - serf: *serf.Serf
+        --
+        + NewServer(config *Config, flat Deps): (*Server, error)
+        + Leave(): error
+        + Shutdown(): error
+        + RPC(ctx context.Context, method string, args, reply interface{}): error
+    }
+    
+    class "consul.Client" as ConsulClient {
+        - config: *Config
+        - logger: hclog.InterceptLogger
+        - connPool: *pool.ConnPool
+        - router: *router.Router
+        - serf: *serf.Serf
+        --
+        + NewClient(config *Config, deps Deps): (*Client, error)
+        + Leave(): error
+        + Shutdown(): error
+        + RPC(ctx context.Context, method string, args, reply interface{}): error
+    }
+}
+
+' 关系定义
+Agent ||--|| BaseDeps : contains
+Agent ||--|| delegate : uses
+Agent ||--|| LocalState : manages
+Agent ||--|| StateSyncer : uses
+Agent ||--|| HTTPHandlers : exposes
+Agent ||--|| Cache : uses
+Agent ||--|| ServiceManager : manages
+Agent ||--o CheckHTTP : manages
+Agent ||--o CheckTCP : manages
+Agent ||--o CheckTTL : manages
+Agent ||--o CheckAlias : manages
+Agent ||--|| ProxyManager : uses
+
+delegate <|-- ConsulServer : implements
+delegate <|-- ConsulClient : implements
+
+CheckBase <|-- CheckHTTP : extends
+CheckBase <|-- CheckTCP : extends
+CheckBase <|-- CheckTTL : extends
+CheckBase <|-- CheckAlias : extends
+
+LocalState ||--|| StateSyncer : syncs with
+HTTPHandlers ||--|| Agent : serves
+ServiceManager ||--|| Agent : manages services for
+
+' 注释
+note top of Agent : 核心 Agent 类\n管理所有 Consul 功能\n位置: agent/agent.go:236
+note top of delegate : 抽象接口\n由 Server 或 Client 实现\n位置: agent/agent.go:155
+note top of LocalState : 本地状态管理\n反熵同步的基础\n位置: agent/local/state.go:172
+note top of StateSyncer : 反熵同步器\n定期同步本地和远程状态\n位置: agent/ae/ae.go:57
+
+@enduml

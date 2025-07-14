@@ -141,6 +141,8 @@ func (s *ServiceManager) RemoveService(serviceID structs.ServiceID) {
 // serviceConfigWatch is a long running helper for composing the end config
 // for a given service from both the local registration and the global
 // service/proxy defaults.
+// serviceConfigWatch 是一个长期运行的辅助工具，用于组合某个服务的最终配置，
+// 该配置来自本地注册信息和全局的 service/proxy 默认值。
 type serviceConfigWatch struct {
 	registration addServiceLockedRequest
 	agent        *Agent

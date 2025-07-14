@@ -1,0 +1,167 @@
+@startuml Service Register 时序图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 20
+skinparam maxmessagesize 60
+skinparam sequenceParticipant underline
+
+title Consul 服务注册时序图
+
+actor "客户端" as Client
+participant "HTTP 处理器" as HTTP #LightBlue
+participant "Agent" as Agent #LightGreen
+participant "本地状态" as LocalState #Yellow
+participant "RPC 客户端" as RPC #Orange
+participant "Catalog 端点" as Catalog #Pink
+participant "FSM" as FSM #LightCyan
+participant "状态存储" as StateStore #LightGray
+participant "反熵同步" as AntiEntropy #Lavender
+
+== Agent 服务注册流程 ==
+
+Client -> HTTP: PUT /v1/agent/service/register
+note right: 代码位置:\nagent/http_register.go:59\nregisterEndpoint()
+
+HTTP -> HTTP: AgentRegisterService()
+note right: 代码位置:\nagent/agent_endpoint.go:1150-1165\n解析请求体和企业元数据
+
+HTTP -> HTTP: 验证服务名称
+note right: 检查 args.Name != ""
+
+HTTP -> HTTP: 解析 Token 和企业元数据
+note right: parseEntMetaNoWildcard()\nparseToken()
+
+HTTP -> Agent: AddService(req)
+note right: 代码位置:\nagent/agent.go:2347-2357\nAddServiceRequest 结构
+
+Agent -> Agent: addServiceLocked()
+note right: 代码位置:\nagent/agent.go:2361-2389\n获取状态锁
+
+Agent -> Agent: validateService()
+note right: 验证服务配置和检查类型
+
+Agent -> Agent: addServiceInternal()
+note right: 代码位置:\nagent/agent.go:2534-2557\n内部服务添加逻辑
+
+Agent -> LocalState: AddServiceWithChecks()
+note right: 代码位置:\nagent/local/state.go\n添加服务到本地状态
+
+LocalState -> LocalState: 更新本地服务状态
+note right: 标记服务为未同步状态\nInSync = false
+
+Agent -> AntiEntropy: TriggerSyncChanges()
+note right: 触发反熵同步机制
+
+== 反熵同步流程 ==
+
+AntiEntropy -> AntiEntropy: SyncChanges()
+note right: 代码位置:\nagent/local/state.go:1245-1259\n同步本地状态变更
+
+AntiEntropy -> AntiEntropy: syncNodeInfo()
+note right: 同步节点信息
+
+AntiEntropy -> RPC: RPC("Catalog.Register")
+note right: 调用 Catalog.Register RPC
+
+== Catalog 注册流程 ==
+
+RPC -> Catalog: Register(args, reply)
+note right: 代码位置:\nagent/consul/catalog_endpoint.go:107-121
+
+Catalog -> Catalog: ForwardRPC()
+note right: 如果不是 Leader，转发到 Leader
+
+Catalog -> Catalog: ResolveTokenAndDefaultMeta()
+note right: 解析 ACL Token 和企业元数据
+
+Catalog -> Catalog: validateEnterpriseRequest()
+note right: 验证企业版请求
+
+Catalog -> StateStore: ValidateRegisterRequest()
+note right: 代码位置:\nagent/consul/state/catalog.go\n验证注册请求
+
+Catalog -> Catalog: nodePreApply()
+note right: 节点预处理验证
+
+Catalog -> Catalog: servicePreApply()
+note right: 服务预处理验证\n检查 ACL 权限
+
+Catalog -> Catalog: checkPreApply()
+note right: 健康检查预处理
+
+Catalog -> StateStore: NodeServices()
+note right: 查询现有节点服务
+
+Catalog -> Catalog: vetRegisterWithACL()
+note right: ACL 权限验证
+
+Catalog -> Catalog: raftApply()
+note right: 提交到 Raft 日志
+
+== FSM 状态机处理 ==
+
+Catalog -> FSM: applyRegister()
+note right: 代码位置:\nagent/consul/fsm/commands_ce.go:153-170\nRaft 日志应用
+
+FSM -> FSM: decodeRegistrationReq()
+note right: 解码注册请求
+
+FSM -> StateStore: EnsureRegistration()
+note right: 代码位置:\nagent/consul/state/catalog.go:143-152\n确保注册事务
+
+StateStore -> StateStore: ensureRegistrationTxn()
+note right: 事务性注册处理
+
+StateStore -> StateStore: 更新节点信息
+note right: 插入或更新节点记录
+
+StateStore -> StateStore: 更新服务信息
+note right: 插入或更新服务记录
+
+StateStore -> StateStore: 更新健康检查
+note right: 插入或更新检查记录
+
+StateStore -> StateStore: tx.Commit()
+note right: 提交事务
+
+FSM -> Catalog: 返回成功
+Catalog -> RPC: 返回成功
+RPC -> AntiEntropy: 返回成功
+
+AntiEntropy -> LocalState: 标记服务已同步
+note right: InSync = true
+
+LocalState -> Agent: 同步完成
+Agent -> HTTP: 返回成功
+HTTP -> Client: HTTP 200 OK
+
+== Catalog 直接注册流程 ==
+
+Client -> HTTP: PUT /v1/catalog/register
+note right: 代码位置:\nagent/http_register.go:62\nCatalogRegister 端点
+
+HTTP -> HTTP: CatalogRegister()
+note right: 代码位置:\nagent/catalog_endpoint.go:134-163
+
+HTTP -> HTTP: parseEntMetaNoWildcard()
+note right: 解析企业元数据
+
+HTTP -> HTTP: decodeBody()
+note right: 解析请求体到 RegisterRequest
+
+HTTP -> HTTP: 设置默认数据中心
+note right: args.Datacenter = s.agent.config.Datacenter
+
+HTTP -> HTTP: parseToken()
+note right: 解析认证 Token
+
+HTTP -> RPC: RPC("Catalog.Register")
+note right: 直接调用 Catalog.Register
+
+note over Catalog, StateStore: 后续流程与上述 Catalog 注册流程相同
+
+RPC -> HTTP: 返回结果
+HTTP -> Client: HTTP 200 OK / Error
+
+@enduml

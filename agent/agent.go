@@ -2410,6 +2410,10 @@ type addServiceLockedRequest struct {
 	// centralized config.
 	// serviceDefaults is called when the Agent.stateLock is held, so it must
 	// never attempt to acquire that lock.
+	// serviceDefaults 是一个用于返回集中式服务配置的函数。
+	// 当从磁盘加载服务定义时，它会返回从持久化文件中读取的副本。
+	// 否则，它会从 Server 查询集中式配置。
+	// serviceDefaults 在持有 Agent.stateLock 时被调用，因此它绝不能尝试获取该锁。
 	serviceDefaults func(context.Context) (*structs.ServiceConfigResponse, error)
 
 	// checkStateSnapshot may optionally be set to a snapshot of the checks in

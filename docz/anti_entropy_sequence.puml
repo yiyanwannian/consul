@@ -1,0 +1,228 @@
+@startuml 反熵同步机制时序图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 20
+skinparam maxmessagesize 60
+skinparam sequenceParticipant underline
+
+title Consul 反熵同步机制时序图
+
+participant "应用程序" as App
+participant "Agent" as Agent
+participant "local.State" as LocalState
+participant "ae.StateSyncer" as Syncer
+participant "Trigger" as Trigger
+participant "Consul集群" as Cluster
+participant "定时器" as Timer
+
+== 初始化阶段 ==
+
+Agent -> LocalState: NewState(config, logger, tokens)
+note right: 代码位置:\nagent/local/state.go:225\n创建本地状态管理器
+
+Agent -> Syncer: NewStateSyncer(state, interval, shutdownCh, logger)
+note right: 代码位置:\nagent/ae/ae.go:120\n创建反熵同步器
+
+Syncer -> Trigger: NewTrigger() x2
+note right: 创建 SyncFull 和 SyncChanges 触发器
+
+Agent -> Syncer: StartSync()
+note right: 代码位置:\nagent/agent.go:1972\n启动同步协程
+
+Syncer -> Syncer: Run()
+note right: 启动状态机\n初始状态: fullSyncState
+
+== 全量同步流程 ==
+
+Syncer -> Syncer: nextFSMState(fullSyncState)
+note right: 状态机处理全量同步
+
+Syncer -> LocalState: SyncFull()
+note right: 执行全量同步
+
+LocalState -> LocalState: 比较本地和远程状态
+note right: 检查所有服务和检查项
+
+LocalState -> Cluster: RPC("Catalog.List")
+note right: 获取远程状态
+
+Cluster -> LocalState: 返回远程服务列表
+
+LocalState -> LocalState: diffServices(local, remote)
+note right: 计算差异
+
+loop 对每个需要同步的服务
+    LocalState -> Cluster: RPC("Catalog.Register", service)
+    note right: 注册/更新服务
+    
+    Cluster -> LocalState: 返回成功
+    
+    LocalState -> LocalState: 标记服务已同步
+    note right: service.InSync = true
+end
+
+Syncer -> Syncer: 转换到 partialSyncState
+note right: 全量同步完成\n进入增量同步状态
+
+== 服务变更触发增量同步 ==
+
+App -> Agent: AddService(serviceReq)
+note right: 应用程序注册新服务
+
+Agent -> LocalState: AddServiceWithChecks(service, checks, token, locallyRegistered)
+note right: 添加到本地状态
+
+LocalState -> LocalState: 更新服务映射
+note right: services[serviceID] = serviceState\nservice.InSync = false
+
+LocalState -> Trigger: TriggerSyncChanges()
+note right: 触发增量同步
+
+Trigger -> Trigger: 非阻塞发送信号
+note right: 代码位置:\nagent/ae/trigger.go:17\nselect/default 模式
+
+Syncer -> Syncer: syncChangesEvent()
+note right: 等待同步事件
+
+Trigger -> Syncer: 收到 syncChangesNotifEvent
+note right: 增量同步触发
+
+Syncer -> LocalState: SyncChanges()
+note right: 代码位置:\nagent/local/state.go:1245\n执行增量同步
+
+LocalState -> LocalState: 遍历未同步的服务
+note right: for id, s := range l.services {\n  if !s.InSync { ... }
+
+LocalState -> Cluster: RPC("Catalog.Register", newService)
+note right: 只同步变更的服务
+
+Cluster -> LocalState: 返回成功
+
+LocalState -> LocalState: 标记服务已同步
+note right: service.InSync = true
+
+== 健康检查状态变更 ==
+
+Agent -> Agent: 健康检查执行
+note right: HTTP/TCP/TTL 检查
+
+Agent -> LocalState: UpdateCheck(checkID, status, output)
+note right: 更新检查状态
+
+LocalState -> LocalState: 更新检查映射
+note right: checks[checkID].Status = status\ncheck.InSync = false
+
+LocalState -> Trigger: TriggerSyncChanges()
+note right: 触发增量同步
+
+Syncer -> LocalState: SyncChanges()
+note right: 同步检查状态变更
+
+LocalState -> Cluster: RPC("Catalog.Register", checkUpdate)
+note right: 同步健康检查状态
+
+== 定时全量同步 ==
+
+Timer -> Timer: 定时器到期
+note right: 默认间隔 + 错峰延迟
+
+Timer -> Syncer: syncFullTimerEvent
+note right: 定时全量同步事件
+
+Syncer -> Syncer: 转换到 fullSyncState
+note right: 状态机切换
+
+Syncer -> Syncer: resetNextFullSyncCh()
+note right: 重置下次全量同步时间\n应用错峰延迟
+
+== 集群变更触发全量同步 ==
+
+Cluster -> Agent: 新服务器加入通知
+note right: Serf 成员变更事件
+
+Agent -> Trigger: SyncFull.Trigger()
+note right: 触发立即全量同步
+
+Trigger -> Syncer: syncFullNotifEvent
+note right: 全量同步通知事件
+
+Syncer -> Syncer: 应用错峰延迟
+note right: stagger(serverUpInterval)\n避免雷群效应
+
+Syncer -> Syncer: 转换到 fullSyncState
+note right: 执行全量同步
+
+== 同步失败重试 ==
+
+Syncer -> LocalState: SyncFull()
+note right: 尝试全量同步
+
+LocalState -> Cluster: RPC("Catalog.Register", service)
+note right: 同步请求
+
+Cluster -> LocalState: 返回错误
+note right: 网络错误或服务器故障
+
+LocalState -> Syncer: 返回同步错误
+
+Syncer -> Syncer: 转换到 retryFullSyncState
+note right: 进入重试状态
+
+Syncer -> Syncer: retrySyncFullEvent()
+note right: 等待重试事件
+
+Timer -> Syncer: 重试定时器到期
+note right: 指数退避延迟
+
+Syncer -> Syncer: 转换到 fullSyncState
+note right: 重新尝试全量同步
+
+== 暂停和恢复同步 ==
+
+Agent -> Syncer: Pause()
+note right: 暂停同步\n通常在配置重载时
+
+Syncer -> Syncer: paused++
+note right: 增加暂停计数
+
+App -> Agent: 批量操作
+note right: 大量服务注册/注销
+
+Agent -> Syncer: Resume()
+note right: 恢复同步
+
+Syncer -> Syncer: paused--
+note right: 减少暂停计数
+
+alt paused == 0
+    Syncer -> Trigger: SyncChanges.Trigger()
+    note right: 触发同步恢复后的变更
+end
+
+== 优雅关闭 ==
+
+Agent -> Syncer: 发送关闭信号
+note right: close(shutdownCh)
+
+Syncer -> Syncer: 收到 shutdownEvent
+note right: 状态机收到关闭事件
+
+Syncer -> Syncer: 转换到 doneState
+note right: 状态机结束
+
+Syncer -> Syncer: 清理资源
+note right: 停止所有协程和定时器
+
+note over App, Cluster
+    反熵同步机制特点:
+    1. 自动检测和修复数据不一致
+    2. 支持全量和增量两种同步模式
+    3. 错峰同步避免雷群效应
+    4. 非阻塞触发机制
+    5. 状态机管理同步流程
+    6. 指数退避重试机制
+    7. 支持暂停和恢复
+end note
+
+@enduml
