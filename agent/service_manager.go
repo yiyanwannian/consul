@@ -78,6 +78,21 @@ func (s *ServiceManager) Stop() {
 // merged with the global defaults before registration.
 //
 // NOTE: the caller must hold the Agent.stateLock!
+// AddService 会在给定服务上（重新）创建一个 serviceConfigWatch。
+// 每次调用此函数时，第一次注册会在当前流程中完成，并通过 agent cache 读取合并后的全局默认配置
+// （无论该服务是否已注册）。这样可以让校验或授权相关的错误直接通过调用方的 RPC 返回。
+// 注册成功后，会有一个 goroutine 在后台持续更新该服务配置。
+//
+// 如果 waitForCentralConfig=true，初始注册会阻塞，直到通过 cache 获取到合并后的全局配置。
+// 如果为 false，则不会进行此类 RPC，只会使用 previousDefaults。
+//
+// persistServiceConfig 控制初始注册时是否将服务配置再次持久化到磁盘。所有后台更新都会持久化。
+//
+// service、chkTypes、persist、token、replaceExistingChecks 和 source
+// 基本上是传递给 Agent.addServiceInternal 的参数，语义保持一致。
+// 唯一的区别是，这里传入的 service 会在注册前与全局默认配置合并。
+//
+// 注意：调用方必须持有 Agent.stateLock！
 func (s *ServiceManager) AddService(req addServiceLockedRequest) error {
 	s.servicesLock.Lock()
 	defer s.servicesLock.Unlock()
@@ -126,6 +141,8 @@ func (s *ServiceManager) RemoveService(serviceID structs.ServiceID) {
 // serviceConfigWatch is a long running helper for composing the end config
 // for a given service from both the local registration and the global
 // service/proxy defaults.
+// serviceConfigWatch 是一个长期运行的辅助工具，用于组合某个服务的最终配置，
+// 该配置来自本地注册信息和全局的 service/proxy 默认值。
 type serviceConfigWatch struct {
 	registration addServiceLockedRequest
 	agent        *Agent

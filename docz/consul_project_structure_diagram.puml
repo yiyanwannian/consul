@@ -1,0 +1,272 @@
+@startuml Consul 项目结构图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam packageStyle rectangle
+skinparam roundcorner 10
+skinparam shadowing false
+
+title Consul 项目文件结构架构图
+
+package "根目录" as root {
+    [main.go] as main
+    [go.mod] as gomod
+    [Makefile] as make
+    [Dockerfile] as docker
+}
+
+package "核心模块" as core {
+    package "agent/" as agent_pkg {
+        [agent.go] as agent_main
+        [http.go] as http_server
+        [dns.go] as dns_server
+        
+        package "consul/" as consul_pkg {
+            [server.go] as consul_server
+            [client.go] as consul_client
+            [catalog_endpoint.go] as catalog_rpc
+            
+            package "fsm/" as fsm_pkg {
+                [commands_ce.go] as fsm_commands
+                [snapshot.go] as fsm_snapshot
+            }
+            
+            package "state/" as state_pkg {
+                [catalog.go] as state_catalog
+                [store.go] as state_store
+            }
+        }
+        
+        package "local/" as local_pkg {
+            [state.go] as local_state
+        }
+        
+        package "config/" as config_pkg {
+            [config.go] as config_main
+            [runtime.go] as runtime_config
+        }
+        
+        package "structs/" as structs_pkg {
+            [structs.go] as structs_main
+        }
+    }
+    
+    package "api/" as api_pkg {
+        [api.go] as api_main
+        [agent.go] as api_agent
+        [catalog.go] as api_catalog
+        [health.go] as api_health
+        [kv.go] as api_kv
+        [go.mod] as api_gomod
+    }
+    
+    package "command/" as command_pkg {
+        [registry.go] as cmd_registry
+        
+        package "agent/" as cmd_agent_pkg {
+            [agent.go] as cmd_agent
+        }
+        
+        package "acl/" as cmd_acl_pkg {
+            [acl.go] as cmd_acl
+        }
+        
+        package "catalog/" as cmd_catalog_pkg {
+            [catalog.go] as cmd_catalog
+        }
+    }
+}
+
+package "Service Mesh" as connect {
+    package "connect/" as connect_pkg {
+        [service.go] as connect_service
+        [tls.go] as connect_tls
+        [resolver.go] as connect_resolver
+        
+        package "proxy/" as proxy_pkg {
+            [proxy.go] as proxy_main
+        }
+        
+        package "certgen/" as certgen_pkg {
+            [certgen.go] as certgen_main
+        }
+    }
+}
+
+package "协议定义" as proto {
+    package "proto/" as proto_internal {
+        package "private/" as proto_private {
+            [pbcommon/] as pb_common
+            [pbconfig/] as pb_config
+        }
+    }
+    
+    package "proto-public/" as proto_public {
+        [pbresource/] as pb_resource
+        [pbdataplane/] as pb_dataplane
+        [pbconnectca/] as pb_connectca
+        [pbacl/] as pb_acl
+        [go.mod] as proto_gomod
+    }
+}
+
+package "内部模块" as internal {
+    package "internal/" as internal_pkg {
+        package "controller/" as controller_pkg {
+            [controller.go] as controller_main
+        }
+        
+        package "resource/" as resource_pkg {
+            [resource.go] as resource_main
+        }
+        
+        package "storage/" as storage_pkg {
+            [storage.go] as storage_main
+        }
+        
+        package "multicluster/" as multicluster_pkg {
+            [multicluster.go] as multicluster_main
+        }
+    }
+}
+
+package "支撑模块" as support {
+    package "lib/" as lib_pkg {
+        [retry/] as lib_retry
+        [ttlcache/] as lib_cache
+        [semaphore/] as lib_semaphore
+        [template/] as lib_template
+    }
+    
+    package "types/" as types_pkg {
+        [node_id.go] as types_node
+        [checks.go] as types_checks
+    }
+    
+    package "logging/" as logging_pkg {
+        [logger.go] as logging_main
+        [logfile.go] as logging_file
+        [monitor/] as logging_monitor
+    }
+    
+    package "tlsutil/" as tlsutil_pkg {
+        [config.go] as tls_config
+        [generate.go] as tls_generate
+    }
+}
+
+package "测试和文档" as test_docs {
+    package "test/" as test_pkg {
+        [单元测试] as unit_test
+    }
+    
+    package "test-integ/" as integ_test_pkg {
+        [集成测试] as integ_test
+    }
+    
+    package "docs/" as docs_pkg {
+        [技术文档] as tech_docs
+    }
+    
+    package "docz/" as docz_pkg {
+        [自定义文档] as custom_docs
+    }
+    
+    package "website/" as website_pkg {
+        [官方网站] as official_site
+    }
+}
+
+package "前端和构建" as frontend_build {
+    package "ui/" as ui_pkg {
+        [Web界面] as web_ui
+        [package.json] as ui_package
+    }
+    
+    package "build-support/" as build_pkg {
+        [构建脚本] as build_scripts
+        [docker/] as build_docker
+    }
+    
+    package "version/" as version_pkg {
+        [version.go] as version_main
+        [VERSION] as version_file
+    }
+}
+
+' 依赖关系
+main --> agent_main
+agent_main --> consul_server
+agent_main --> consul_client
+agent_main --> local_state
+agent_main --> http_server
+agent_main --> dns_server
+
+consul_server --> fsm_commands
+consul_server --> state_catalog
+consul_client --> catalog_rpc
+
+cmd_registry --> cmd_agent
+cmd_registry --> cmd_acl
+cmd_registry --> cmd_catalog
+
+cmd_agent --> agent_main
+api_main --> http_server
+
+connect_service --> connect_tls
+connect_service --> consul_client
+
+fsm_commands --> state_store
+local_state --> structs_main
+
+agent_main --> config_main
+agent_main --> logging_main
+agent_main --> types_node
+
+consul_server --> lib_retry
+consul_server --> tls_config
+
+' 模块间关系
+core --> support
+core --> proto
+connect --> core
+internal --> core
+test_docs --> core
+frontend_build --> core
+
+' 样式设置
+skinparam package<<core>> {
+    BackgroundColor #E1F5FE
+    BorderColor #0277BD
+}
+
+skinparam package<<connect>> {
+    BackgroundColor #E8F5E8
+    BorderColor #2E7D32
+}
+
+skinparam package<<proto>> {
+    BackgroundColor #FFF3E0
+    BorderColor #F57C00
+}
+
+skinparam package<<internal>> {
+    BackgroundColor #F3E5F5
+    BorderColor #7B1FA2
+}
+
+skinparam package<<support>> {
+    BackgroundColor #FCE4EC
+    BorderColor #C2185B
+}
+
+skinparam package<<test_docs>> {
+    BackgroundColor #F1F8E9
+    BorderColor #689F38
+}
+
+skinparam package<<frontend_build>> {
+    BackgroundColor #FFF8E1
+    BorderColor #FFA000
+}
+
+@enduml

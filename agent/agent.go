@@ -2341,26 +2341,31 @@ func (a *Agent) readPersistedServiceConfigs() (map[structs.ServiceID]*structs.Se
 	return out, nil
 }
 
-// AddService is used to add a service entry and its check. Any check for this service missing from chkTypes will be deleted.
-// This entry is persistent and the agent will make a best effort to
-// ensure it is registered
+// AddService 用于添加服务条目及其健康检查
+// chkTypes 中缺失的此服务的任何检查都将被删除
+// 此条目是持久的，Agent 将尽最大努力确保其被注册到集群中
 func (a *Agent) AddService(req AddServiceRequest) error {
+	// 获取状态锁，防止并发修改服务状态
+	// 这是服务注册流程中的关键同步点
 	a.stateLock.Lock()
 	defer a.stateLock.Unlock()
 
+	// 构造带锁的服务添加请求，包含服务默认配置
 	rl := addServiceLockedRequest{
-		AddServiceRequest:    req,
-		serviceDefaults:      serviceDefaultsFromCache(a.baseDeps, req),
-		persistServiceConfig: true,
+		AddServiceRequest:    req,                                        // 原始的服务添加请求
+		serviceDefaults:      serviceDefaultsFromCache(a.baseDeps, req), // 从缓存中获取服务默认配置
+		persistServiceConfig: true,                                       // 标记需要持久化服务配置
 	}
+	// 调用实际的服务添加逻辑（已持有锁）
 	return a.addServiceLocked(rl)
 }
 
-// addServiceLocked adds a service entry to the service manager if enabled, or directly
-// to the local state if it is not. This function assumes the state lock is already held.
+// addServiceLocked 将服务条目添加到服务管理器（如果启用）或直接添加到本地状态
+// 此函数假设状态锁已经被持有
 func (a *Agent) addServiceLocked(req addServiceLockedRequest) error {
-	// Must auto-assign the port and default checks (if needed) here to avoid race collisions.
+	// 必须在这里自动分配端口和默认检查（如果需要）以避免竞态冲突
 	if req.Service.LocallyRegisteredAsSidecar {
+		// 如果是本地注册的 Sidecar 服务且未指定端口，自动分配端口
 		if req.Service.Port < 1 {
 			port, err := a.sidecarPortFromServiceIDLocked(req.Service.CompoundServiceID())
 			if err != nil {
@@ -2368,23 +2373,28 @@ func (a *Agent) addServiceLocked(req addServiceLockedRequest) error {
 			}
 			req.Service.Port = port
 		}
-		// Setup default check if none given.
+		// 如果没有提供健康检查配置，设置默认的健康检查
 		if len(req.chkTypes) < 1 {
 			req.chkTypes = sidecarDefaultChecks(req.Service.ID, req.Service.Address, req.Service.Proxy.LocalServiceAddress, req.Service.Port)
 		}
 	}
 
+	// 标准化企业版元数据（分区、命名空间等）
 	req.Service.EnterpriseMeta.Normalize()
 
+	// 验证服务配置和健康检查类型的有效性
 	if err := a.validateService(req.Service, req.chkTypes); err != nil {
 		return err
 	}
 
+	// 如果启用了中央服务配置且服务是 Sidecar 代理或网关，使用服务管理器处理
 	if a.config.EnableCentralServiceConfig && (req.Service.IsSidecarProxy() || req.Service.IsGateway()) {
 		return a.serviceManager.AddService(req)
 	}
 
+	// 对于普通服务，不需要持久化服务配置（已在上层处理）
 	req.persistServiceConfig = false
+	// 调用内部服务添加方法，处理实际的服务注册逻辑
 	return a.addServiceInternal(addServiceInternalRequest{addServiceLockedRequest: req})
 }
 
@@ -2400,6 +2410,10 @@ type addServiceLockedRequest struct {
 	// centralized config.
 	// serviceDefaults is called when the Agent.stateLock is held, so it must
 	// never attempt to acquire that lock.
+	// serviceDefaults 是一个用于返回集中式服务配置的函数。
+	// 当从磁盘加载服务定义时，它会返回从持久化文件中读取的副本。
+	// 否则，它会从 Server 查询集中式配置。
+	// serviceDefaults 在持有 Agent.stateLock 时被调用，因此它绝不能尝试获取该锁。
 	serviceDefaults func(context.Context) (*structs.ServiceConfigResponse, error)
 
 	// checkStateSnapshot may optionally be set to a snapshot of the checks in
@@ -2433,39 +2447,45 @@ type addServiceInternalRequest struct {
 	persistServiceDefaults *structs.ServiceConfigResponse
 }
 
-// addServiceInternal adds the given service and checks to the local state.
+// addServiceInternal 将给定的服务和检查添加到本地状态
 func (a *Agent) addServiceInternal(req addServiceInternalRequest) error {
 	service := req.Service
 
-	// Pause the service syncs during modification
+	// 在修改期间暂停服务同步，避免并发冲突
 	a.PauseSync()
 	defer a.ResumeSync()
 
-	// Set default tagged addresses
+	// 设置默认的标记地址（IPv4 和 IPv6）
 	serviceIP := net.ParseIP(service.Address)
-	serviceAddressIs4 := serviceIP != nil && serviceIP.To4() != nil
-	serviceAddressIs6 := serviceIP != nil && serviceIP.To4() == nil
+	serviceAddressIs4 := serviceIP != nil && serviceIP.To4() != nil  // 判断是否为 IPv4 地址
+	serviceAddressIs6 := serviceIP != nil && serviceIP.To4() == nil  // 判断是否为 IPv6 地址
 	if service.TaggedAddresses == nil {
 		service.TaggedAddresses = map[string]structs.ServiceAddress{}
 	}
+	// 为 IPv4 地址设置 LAN 标记地址
 	if _, ok := service.TaggedAddresses[structs.TaggedAddressLANIPv4]; !ok && serviceAddressIs4 {
 		service.TaggedAddresses[structs.TaggedAddressLANIPv4] = structs.ServiceAddress{Address: service.Address, Port: service.Port}
 	}
+	// 为 IPv4 地址设置 WAN 标记地址
 	if _, ok := service.TaggedAddresses[structs.TaggedAddressWANIPv4]; !ok && serviceAddressIs4 {
 		service.TaggedAddresses[structs.TaggedAddressWANIPv4] = structs.ServiceAddress{Address: service.Address, Port: service.Port}
 	}
+	// 为 IPv6 地址设置 LAN 标记地址
 	if _, ok := service.TaggedAddresses[structs.TaggedAddressLANIPv6]; !ok && serviceAddressIs6 {
 		service.TaggedAddresses[structs.TaggedAddressLANIPv6] = structs.ServiceAddress{Address: service.Address, Port: service.Port}
 	}
+	// 为 IPv6 地址设置 WAN 标记地址
 	if _, ok := service.TaggedAddresses[structs.TaggedAddressWANIPv6]; !ok && serviceAddressIs6 {
 		service.TaggedAddresses[structs.TaggedAddressWANIPv6] = structs.ServiceAddress{Address: service.Address, Port: service.Port}
 	}
 
+	// 初始化健康检查列表
 	var checks []*structs.HealthCheck
 
-	// all the checks must be associated with the same enterprise meta of the service
-	// so this map can just use the main CheckID for indexing
+	// 所有检查都必须与服务的企业版元数据关联
+	// 因此这个映射可以只使用主 CheckID 进行索引
 	existingChecks := map[structs.CheckID]bool{}
+	// 获取此服务的现有检查，标记为未处理状态
 	for _, check := range a.State.ChecksForService(service.CompoundServiceID(), false) {
 		existingChecks[check.CompoundCheckID()] = false
 	}
@@ -2543,6 +2563,7 @@ func (a *Agent) addServiceInternal(req addServiceInternalRequest) error {
 		cleanupServices = append(cleanupServices, sid)
 	}
 
+	// 记录新添加的健康检查，用于失败时的清理
 	for _, check := range checks {
 		cid := check.CompoundCheckID()
 		if c := a.State.Check(cid); c == nil {
@@ -2550,20 +2571,27 @@ func (a *Agent) addServiceInternal(req addServiceInternalRequest) error {
 		}
 	}
 
+	// 关键步骤：将服务和健康检查添加到本地状态管理器
+	// 这会触发 Anti-Entropy 同步机制，将服务注册到集群
 	err := a.State.AddServiceWithChecks(service, checks, req.token, req.Source == ConfigSourceLocal)
 	if err != nil {
+		// 如果添加失败，清理已创建的服务和检查
 		a.cleanupRegistration(cleanupServices, cleanupChecks)
 		return err
 	}
 
+	// 获取配置来源和持久化标志
 	source := req.Source
 	persist := req.persist
+	// 为每个健康检查启动监控器
 	for i := range checks {
+		// 添加健康检查到 Agent 的检查管理器
 		if err := a.addCheck(checks[i], req.chkTypes[i], service, req.token, source); err != nil {
 			a.cleanupRegistration(cleanupServices, cleanupChecks)
 			return err
 		}
 
+		// 如果需要持久化且配置了数据目录，将检查配置保存到磁盘
 		if persist && a.config.DataDir != "" {
 			if err := a.persistCheck(checks[i], req.chkTypes[i], source); err != nil {
 				a.cleanupRegistration(cleanupServices, cleanupChecks)

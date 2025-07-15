@@ -286,14 +286,17 @@ func (h *Health) Checks(service string, q *QueryOptions) (HealthChecks, *QueryMe
 	return out, qm, nil
 }
 
-// Service is used to query health information along with service info
-// for a given service. It can optionally do server-side filtering on a tag
-// or nodes with passing health checks only.
+// Service 用于查询给定服务的健康信息和服务信息
+// 它可以选择性地在服务端进行标签过滤或只返回健康检查通过的节点
 func (h *Health) Service(service, tag string, passingOnly bool, q *QueryOptions) ([]*ServiceEntry, *QueryMeta, error) {
+	// 声明标签切片，用于存储过滤标签
 	var tags []string
+	// 如果提供了标签参数，将其转换为标签切片
 	if tag != "" {
 		tags = []string{tag}
 	}
+	// 调用内部通用方法执行实际的服务健康查询
+	// serviceHealth 常量指定这是普通服务健康查询（非 Connect 或 Ingress）
 	return h.service(service, tags, passingOnly, q, serviceHealth)
 }
 
@@ -325,44 +328,67 @@ func (h *Health) Ingress(service string, passingOnly bool, q *QueryOptions) ([]*
 	return h.service(service, tags, passingOnly, q, ingressHealth)
 }
 
+// service 是所有健康查询方法的内部通用实现
+// 根据 healthType 参数确定查询类型（普通服务、Connect 服务或 Ingress 网关）
 func (h *Health) service(service string, tags []string, passingOnly bool, q *QueryOptions, healthType string) ([]*ServiceEntry, *QueryMeta, error) {
+	// 声明 API 路径变量
 	var path string
+	// 根据健康检查类型确定 HTTP API 端点路径
 	switch healthType {
 	case connectHealth:
+		// Connect 代理服务的健康检查端点
 		path = "/v1/health/connect/" + service
 	case ingressHealth:
+		// Ingress 网关的健康检查端点
 		path = "/v1/health/ingress/" + service
 	default:
+		// 默认的普通服务健康检查端点
 		path = "/v1/health/service/" + service
 	}
 
+	// 创建 HTTP GET 请求对象，指定请求路径
 	r := h.c.newRequest("GET", path)
+	// 设置查询选项（数据中心、命名空间、分区、令牌等）
 	r.setQueryOptions(q)
+	// 如果提供了标签过滤条件，添加到请求参数中
 	if len(tags) > 0 {
 		for _, tag := range tags {
+			// 为每个标签添加 "tag" 查询参数，支持多标签过滤
 			r.params.Add("tag", tag)
 		}
 	}
+	// 如果只需要健康状态为 passing 的服务实例
 	if passingOnly {
+		// 设置 "passing" 参数为 "1"，服务端将过滤掉不健康的实例
 		r.params.Set(HealthPassing, "1")
 	}
+	// 执行 HTTP 请求，返回往返时间、响应对象和错误
 	rtt, resp, err := h.c.doRequest(r)
 	if err != nil {
+		// 如果请求失败（网络错误、超时等），直接返回错误
 		return nil, nil, err
 	}
+	// 确保响应体在函数结束时被关闭，释放资源
 	defer closeResponseBody(resp)
+	// 检查 HTTP 响应状态码，要求为 200 OK
 	if err := requireOK(resp); err != nil {
 		return nil, nil, err
 	}
 
+	// 创建查询元数据对象，用于存储响应的元信息
 	qm := &QueryMeta{}
+	// 从 HTTP 响应头中解析查询元数据（索引、联系时间等）
 	parseQueryMeta(resp, qm)
+	// 设置请求往返时间
 	qm.RequestTime = rtt
 
+	// 声明服务条目切片，用于存储解析后的响应数据
 	var out []*ServiceEntry
+	// 将 JSON 响应体解码为 ServiceEntry 对象切片
 	if err := decodeBody(resp, &out); err != nil {
 		return nil, nil, err
 	}
+	// 返回服务条目列表、查询元数据和无错误
 	return out, qm, nil
 }
 

@@ -1,0 +1,229 @@
+@startuml Agent 组件关系图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam componentStyle rectangle
+skinparam roundcorner 10
+skinparam shadowing false
+
+title Consul Agent 组件关系图
+
+package "Agent 核心容器" as agent_container {
+    component "Agent" as agent #E1F5FE {
+        port "HTTP API" as http_port
+        port "DNS API" as dns_port
+        port "gRPC API" as grpc_port
+        port "RPC" as rpc_port
+    }
+
+    component "BaseDeps" as deps #E1F5FE {
+        port "依赖注入" as deps_port
+    }
+}
+
+package "HTTP 服务层" as http_layer {
+    component "HTTPHandlers" as http_handlers #E8F5E8 {
+        port "路由处理" as route_port
+        port "端点处理" as endpoint_port
+    }
+
+    component "Denylist" as denylist #E8F5E8 {
+        port "访问控制" as access_port
+    }
+}
+
+package "状态管理层" as state_layer {
+    component "local.State" as local_state #FFF3E0 {
+        port "服务状态" as service_state_port
+        port "检查状态" as check_state_port
+        port "同步触发" as sync_trigger_port
+    }
+
+    component "ae.StateSyncer" as state_syncer #FFF3E0 {
+        port "全量同步" as full_sync_port
+        port "增量同步" as delta_sync_port
+        port "同步事件" as sync_event_port
+    }
+
+    component "ServiceManager" as service_manager #FFF3E0 {
+        port "服务配置" as service_config_port
+        port "配置监控" as config_watch_port
+    }
+}
+
+package "健康检查层" as health_layer {
+    component "CheckHTTP" as check_http #F3E5F5 {
+        port "HTTP检查" as http_check_port
+    }
+
+    component "CheckTCP" as check_tcp #F3E5F5 {
+        port "TCP检查" as tcp_check_port
+    }
+
+    component "CheckTTL" as check_ttl #F3E5F5 {
+        port "TTL检查" as ttl_check_port
+    }
+
+    component "CheckAlias" as check_alias #F3E5F5 {
+        port "别名检查" as alias_check_port
+    }
+}
+
+package "缓存层" as cache_layer {
+    component "cache.Cache" as cache #FCE4EC {
+        port "缓存读取" as cache_read_port
+        port "缓存写入" as cache_write_port
+    }
+
+    component "leafcert.Manager" as leaf_cert #FCE4EC {
+        port "证书管理" as cert_port
+    }
+}
+
+package "网络通信层" as network_layer {
+    component "delegate" as delegate #F1F8E9 {
+        port "RPC调用" as rpc_call_port
+        port "集群通信" as cluster_port
+    }
+
+    component "consul.Server" as consul_server #F1F8E9 {
+        port "服务器功能" as server_port
+    }
+
+    component "consul.Client" as consul_client #F1F8E9 {
+        port "客户端功能" as client_port
+    }
+
+    component "grpc.Server" as grpc_server #F1F8E9 {
+        port "gRPC服务" as grpc_service_port
+    }
+}
+
+package "代理配置层" as proxy_layer {
+    component "proxycfg.Manager" as proxy_manager #FFF8E1 {
+        port "代理配置" as proxy_config_port
+    }
+
+    component "xds.Server" as xds_server #FFF8E1 {
+        port "XDS协议" as xds_port
+    }
+}
+
+package "工具组件层" as util_layer {
+    component "token.Store" as token_store #EFEBE9 {
+        port "令牌管理" as token_port
+    }
+
+    component "tlsutil.Configurator" as tls_config #EFEBE9 {
+        port "TLS配置" as tls_port
+    }
+
+    component "routine.Manager" as routine_manager #EFEBE9 {
+        port "协程管理" as routine_port
+    }
+}
+
+' 核心连接关系
+agent --> http_handlers : "HTTP API"
+agent --> grpc_server : "gRPC API"
+agent --> delegate : "RPC调用"
+
+' 依赖注入关系
+deps --> agent : "注入依赖"
+deps --> cache : "提供缓存"
+deps --> leaf_cert : "提供证书管理"
+
+' HTTP 层内部关系
+http_handlers --> denylist : "访问控制"
+
+' 状态管理关系
+agent --> local_state : "管理本地状态"
+local_state --> state_syncer : "触发同步"
+state_syncer --> delegate : "同步到集群"
+
+' 健康检查关系
+agent --> check_http : "HTTP检查"
+agent --> check_tcp : "TCP检查"
+agent --> check_ttl : "TTL检查"
+agent --> check_alias : "别名检查"
+
+check_http --> local_state : "更新状态"
+check_tcp --> local_state : "更新状态"
+check_ttl --> local_state : "更新状态"
+check_alias --> local_state : "更新状态"
+
+' 缓存层关系
+agent --> cache : "缓存访问"
+http_handlers --> cache : "查询缓存"
+cache --> delegate : "缓存更新"
+
+' 网络通信关系
+delegate <|-- consul_server : "服务器实现"
+delegate <|-- consul_client : "客户端实现"
+
+' 代理配置关系
+agent --> proxy_manager : "代理配置"
+proxy_manager --> xds_server : "XDS协议"
+service_manager --> proxy_manager : "服务配置"
+
+' 工具组件关系
+agent --> token_store : "令牌管理"
+agent --> tls_config : "TLS配置"
+agent --> routine_manager : "协程管理"
+
+' 服务管理关系
+agent --> service_manager : "服务管理"
+service_manager --> cache : "配置缓存"
+
+' 证书管理关系
+leaf_cert --> tls_config : "证书配置"
+
+
+
+' 注释说明各组件的样式分类
+' Agent 核心: #E1F5FE
+' HTTP 服务层: #E8F5E8
+' 状态管理层: #FFF3E0
+' 健康检查层: #F3E5F5
+' 缓存层: #FCE4EC
+' 网络通信层: #F1F8E9
+' 代理配置层: #FFF8E1
+' 工具组件层: #EFEBE9
+
+' 图例
+legend right
+    |= 颜色 |= 组件层 |
+    | <#E1F5FE> | Agent 核心 |
+    | <#E8F5E8> | HTTP 服务层 |
+    | <#FFF3E0> | 状态管理层 |
+    | <#F3E5F5> | 健康检查层 |
+    | <#FCE4EC> | 缓存层 |
+    | <#F1F8E9> | 网络通信层 |
+    | <#FFF8E1> | 代理配置层 |
+    | <#EFEBE9> | 工具组件层 |
+endlegend
+
+note top of agent
+    Agent 是整个系统的核心控制器
+    位置: agent/agent.go:236
+    职责: 协调所有组件的工作
+end note
+
+note top of delegate
+    委托模式接口
+    位置: agent/agent.go:155
+    实现: consul.Server 或 consul.Client
+end note
+
+note top of local_state
+    本地状态管理器
+    位置: agent/local/state.go:172
+    职责: 管理服务和检查的本地状态
+end note
+
+note top of state_syncer
+    反熵同步器
+    位置: agent/ae/ae.go:57
+    职责: 同步本地状态到集群
+end note
+
+@enduml

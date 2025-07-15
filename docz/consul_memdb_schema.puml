@@ -1,0 +1,495 @@
+@startuml Consul MemDB Schema
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam class {
+    BackgroundColor #E8F4FD
+    BorderColor #1E88E5
+    ArrowColor #1565C0
+}
+
+title Consul MemDB 数据库模式架构图
+
+package "服务发现核心表" {
+    class nodes {
+        +id: string (PK)
+        +node: string
+        +address: string
+        +datacenter: string
+        +tagged_addresses: map
+        +meta: map
+        +peer_name: string
+        --
+        索引:
+        - id (唯一): node + peer_name
+        - meta (非唯一): 节点元数据
+    }
+
+    class services {
+        +id: string (PK)
+        +node: string (FK)
+        +service_id: string
+        +service_name: string
+        +tags: []string
+        +address: string
+        +port: int
+        +weights: ServiceWeights
+        +enable_tag_override: bool
+        +proxy: ConnectProxyConfig
+        +connect: ServiceConnect
+        +peer_name: string
+        --
+        索引:
+        - id (唯一): node + service_id + peer_name
+        - service (非唯一): service_name
+        - connect (非唯一): connect 服务
+        - kind (非唯一): 服务类型
+    }
+
+    class checks {
+        +id: string (PK)
+        +node: string (FK)
+        +check_id: string
+        +name: string
+        +status: string
+        +notes: string
+        +output: string
+        +service_id: string (FK)
+        +service_name: string
+        +service_tags: []string
+        +type: string
+        +peer_name: string
+        --
+        索引:
+        - id (唯一): node + check_id + peer_name
+        - status (非唯一): 健康状态
+        - service (非唯一): service_id
+        - node (非唯一): node
+        - node_service (非唯一): node + service_id
+    }
+}
+
+package "配置管理表" {
+    class config_entries {
+        +id: string (PK)
+        +kind: string
+        +name: string
+        +config: interface{}
+        +create_index: uint64
+        +modify_index: uint64
+        --
+        索引:
+        - id (唯一): kind + name
+        - link (非唯一): 配置链接
+        - intention-source (非唯一): 意图源
+        - intention-source-sameness-group (非唯一)
+        - sameness-group-member (非唯一)
+        - sameness-group-default (唯一)
+    }
+
+    class kind_service_names {
+        +id: string (PK)
+        +kind: string
+        +name: string
+        --
+        索引:
+        - id (唯一): kind + name
+    }
+}
+
+package "ACL 权限控制表" {
+    class acl_tokens {
+        +accessor_id: string (PK)
+        +secret_id: string (UK)
+        +description: string
+        +policies: []PolicyLink
+        +roles: []RoleLink
+        +service_identities: []ServiceIdentity
+        +node_identities: []NodeIdentity
+        +type: string
+        +rules: string
+        +hash: []byte
+        +create_time: time.Time
+        +expires_ttl: time.Duration
+        +expires_global: bool
+        +expires_local: bool
+        --
+        索引:
+        - accessor (唯一): accessor_id
+        - id (唯一): secret_id
+        - policies (非唯一): 关联策略
+        - roles (非唯一): 关联角色
+        - authmethod (非唯一): 认证方法
+        - locality (非唯一): 本地性
+        - expires-global (非唯一): 全局过期
+        - expires-local (非唯一): 本地过期
+        - service-name (非唯一): 服务名称
+    }
+
+    class acl_policies {
+        +id: string (PK)
+        +name: string (UK)
+        +description: string
+        +rules: string
+        +syntax: SyntaxVersion
+        +datacenters: []string
+        +hash: []byte
+        --
+        索引:
+        - id (唯一): policy_id
+        - name (唯一): policy_name
+    }
+
+    class acl_roles {
+        +id: string (PK)
+        +name: string (UK)
+        +description: string
+        +policies: []PolicyLink
+        +service_identities: []ServiceIdentity
+        +node_identities: []NodeIdentity
+        +hash: []byte
+        --
+        索引:
+        - id (唯一): role_id
+        - name (唯一): role_name
+        - policies (非唯一): 关联策略
+    }
+
+    class acl_binding_rules {
+        +id: string (PK)
+        +description: string
+        +auth_method: string
+        +selector: string
+        +bind_type: BindingRuleBindType
+        +bind_name: string
+        +bind_vars: BindingRuleBindVars
+        --
+        索引:
+        - id (唯一): rule_id
+        - authmethod (非唯一): auth_method
+    }
+
+    class acl_auth_methods {
+        +name: string (PK)
+        +type: string
+        +description: string
+        +config: map[string]interface{}
+        +display_name: string
+        +max_token_ttl: time.Duration
+        +token_locality: string
+        --
+        索引:
+        - id (唯一): method_name
+    }
+}
+
+package "会话和协调表" {
+    class sessions {
+        +id: string (PK)
+        +name: string
+        +node: string (FK)
+        +lock_delay: time.Duration
+        +behavior: SessionBehavior
+        +ttl: time.Duration
+        +checks: []types.CheckID
+        --
+        索引:
+        - id (唯一): session_id
+        - node (非唯一): node
+        - ttl (非唯一): TTL 值
+    }
+
+    class session_checks {
+        +session: string (FK)
+        +node: string (FK)
+        +check_id: string (FK)
+        --
+        索引:
+        - id (唯一): session + node + check_id
+        - node_check (非唯一): node + check_id
+        - session (非唯一): session
+    }
+
+    class coordinates {
+        +node: string (PK)
+        +segment: string (PK)
+        +coord: *coordinate.Coordinate
+        --
+        索引:
+        - id (唯一): node + segment
+        - node (非唯一): node
+    }
+}
+
+package "KV 存储表" {
+    class kvs {
+        +key: string (PK)
+        +value: []byte
+        +flags: uint64
+        +session: string (FK)
+        +lock_index: uint64
+        +create_index: uint64
+        +modify_index: uint64
+        --
+        索引:
+        - id (唯一): key
+        - session (非唯一): session
+    }
+
+    class tombstones {
+        +key: string (PK)
+        +index: uint64
+        --
+        索引:
+        - id (唯一): key
+    }
+}
+
+package "网络拓扑表" {
+    class mesh_topology {
+        +upstream: ServiceName (PK)
+        +downstream: ServiceName (PK)
+        +kind: TopologyKind
+        --
+        索引:
+        - id (唯一): upstream + downstream
+        - upstream (非唯一): upstream
+        - downstream (非唯一): downstream
+    }
+
+    class gateway_services {
+        +gateway: ServiceName (PK)
+        +service: ServiceName (PK)
+        +gateway_kind: ServiceKind
+        +port: int (PK)
+        +protocol: string
+        +hosts: []string
+        +ca_file: string
+        +cert_file: string
+        +key_file: string
+        +sni: string
+        --
+        索引:
+        - id (唯一): gateway + service + port
+        - gateway (非唯一): gateway
+        - service (非唯一): service
+    }
+
+    class service_virtual_ips {
+        +service: PeeredServiceName (PK)
+        +ip: net.IP
+        +manual_ips: []string
+        --
+        索引:
+        - id (唯一): service
+        - manual-vips (非唯一): manual_ips
+    }
+
+    class free_virtual_ips {
+        +ip: string (PK)
+        --
+        索引:
+        - id (唯一): ip
+    }
+}
+
+package "集群对等表" {
+    class peering {
+        +id: string (PK)
+        +name: string (UK)
+        +partition: string
+        +state: PeeringState
+        +peer_id: string
+        +peer_ca_pems: []string
+        +peer_server_name: string
+        +peer_server_addresses: []string
+        +create_index: uint64
+        +modify_index: uint64
+        +deleted_at: *time.Time
+        --
+        索引:
+        - id (唯一): peering_id
+        - name (唯一): name
+        - deleted (非唯一): 删除状态
+    }
+
+    class peering_trust_bundles {
+        +trust_domain: string (PK)
+        +peer_name: string
+        +partition: string
+        +root_pems: []string
+        +exported_partition: string
+        +create_index: uint64
+        +modify_index: uint64
+        --
+        索引:
+        - id (唯一): peer_name
+    }
+
+    class peering_secrets {
+        +peer_id: string (PK)
+        +establishment: *PeeringSecrets_Establishment
+        +stream: *PeeringSecrets_Stream
+        --
+        索引:
+        - id (唯一): peer_id
+    }
+
+    class peering_secret_uuids {
+        +secret_id: string (PK)
+        --
+        索引:
+        - id (唯一): secret_id
+    }
+
+    class federation_states {
+        +datacenter: string (PK)
+        +mesh_gateways: []CheckServiceNode
+        +update_time: time.Time
+        --
+        索引:
+        - id (唯一): datacenter
+    }
+}
+
+package "查询和意图表" {
+    class prepared_queries {
+        +id: string (PK)
+        +name: string (UK)
+        +session: string (FK)
+        +token: string
+        +template: QueryTemplate
+        +service: QueryService
+        --
+        索引:
+        - id (唯一): query_id
+        - name (唯一): query_name
+        - template (唯一): 模板查询
+        - session (非唯一): session
+    }
+
+    class connect_intentions {
+        +id: string (PK)
+        +description: string
+        +source_ns: string
+        +source_name: string
+        +destination_ns: string
+        +destination_name: string
+        +source_type: IntentionSourceType
+        +action: IntentionAction
+        +default_addr: string
+        +default_port: int
+        +meta: map[string]string
+        +precedence: int
+        --
+        索引:
+        - id (唯一): intention_id
+        - destination (非唯一): dest_ns + dest_name
+        - source (非唯一): source_ns + source_name
+        - source_destination (非唯一): 源和目标组合
+    }
+}
+
+package "系统管理表" {
+    class index {
+        +key: string (PK)
+        +value: uint64
+        --
+        索引:
+        - id (唯一): key
+    }
+
+    class system_metadata {
+        +key: string (PK)
+        +value: string
+        --
+        索引:
+        - id (唯一): key
+    }
+
+    class autopilot_config {
+        +cleanup_dead_servers: bool
+        +last_contact_threshold: time.Duration
+        +max_trailing_logs: uint64
+        +min_quorum: uint
+        +server_stabilization_time: time.Duration
+        +redundancy_zone_tag: string
+        +disable_upgrade_migration: bool
+        +upgrade_version_tag: string
+        --
+        索引:
+        - id (唯一): 单例配置
+    }
+
+    class usage {
+        +id: string (PK)
+        +count: int
+        +usage_type: string
+        --
+        索引:
+        - id (唯一): usage_id
+    }
+}
+
+package "CA 和安全表" {
+    class connect_ca_config {
+        +provider: string
+        +config: map[string]interface{}
+        +state: map[string]string
+        +force_reconfig_to_secondary: bool
+        +create_index: uint64
+        +modify_index: uint64
+        --
+        索引:
+        - id (唯一): 单例配置
+    }
+
+    class connect_ca_roots {
+        +id: string (PK)
+        +name: string
+        +serial_number: uint64
+        +signing_key_id: string
+        +external_trust_domain: string
+        +not_before: time.Time
+        +not_after: time.Time
+        +root_cert: string
+        +intermediate_certs: []string
+        +active: bool
+        +private_key_type: string
+        +private_key_bits: int
+        +create_index: uint64
+        +modify_index: uint64
+        --
+        索引:
+        - id (唯一): root_id
+    }
+
+    class connect_ca_builtin {
+        +id: string (PK)
+        +private_key: string
+        +root_cert: string
+        +active_root_id: string
+        +active_intermediate_id: string
+        --
+        索引:
+        - id (唯一): provider_id
+    }
+}
+
+' 关系定义
+nodes ||--o{ services : "一个节点可以有多个服务"
+nodes ||--o{ checks : "一个节点可以有多个检查"
+services ||--o{ checks : "一个服务可以有多个检查"
+sessions ||--o{ kvs : "会话可以锁定 KV 条目"
+sessions ||--o{ session_checks : "会话关联检查"
+nodes ||--o{ session_checks : "节点关联会话检查"
+checks ||--o{ session_checks : "检查关联会话"
+nodes ||--o{ coordinates : "节点网络坐标"
+acl_tokens ||--o{ acl_policies : "令牌关联策略"
+acl_tokens ||--o{ acl_roles : "令牌关联角色"
+acl_roles ||--o{ acl_policies : "角色关联策略"
+acl_binding_rules ||--o{ acl_auth_methods : "绑定规则关联认证方法"
+services ||--o{ mesh_topology : "服务拓扑关系"
+services ||--o{ gateway_services : "网关服务关系"
+prepared_queries ||--o{ sessions : "预备查询关联会话"
+
+@enduml

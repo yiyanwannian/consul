@@ -1,0 +1,171 @@
+@startuml Consul 集群架构图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+
+title Consul 分布式集群架构
+
+package "数据中心 1 (DC1)" as DC1 {
+    package "Consul 服务器集群" as ServerCluster1 {
+        component "Server 1\n(Leader)" as S1 #lightblue
+        component "Server 2\n(Follower)" as S2 #lightgreen
+        component "Server 3\n(Follower)" as S3 #lightgreen
+        
+        note right of S1 : Raft 领导者\n处理写入请求\n协调集群状态
+        note right of S2 : Raft 跟随者\n复制日志\n处理读取请求
+        note right of S3 : Raft 跟随者\n复制日志\n处理读取请求
+    }
+    
+    package "Consul 客户端节点" as ClientCluster1 {
+        component "Client 1" as C1 #lightyellow
+        component "Client 2" as C2 #lightyellow
+        component "Client 3" as C3 #lightyellow
+    }
+    
+    package "应用服务" as AppServices1 {
+        component "Web 服务" as Web1 #lightcoral
+        component "API 服务" as API1 #lightcoral
+        component "数据库服务" as DB1 #lightcoral
+    }
+    
+    package "网络通信层" as Network1 {
+        component "LAN Serf\n(端口 8301)" as LAN1 #lightgray
+        component "Raft RPC\n(端口 8300)" as RPC1 #lightgray
+    }
+}
+
+package "数据中心 2 (DC2)" as DC2 {
+    package "Consul 服务器集群" as ServerCluster2 {
+        component "Server 4\n(Leader)" as S4 #lightblue
+        component "Server 5\n(Follower)" as S5 #lightgreen
+        component "Server 6\n(Follower)" as S6 #lightgreen
+    }
+    
+    package "Consul 客户端节点" as ClientCluster2 {
+        component "Client 4" as C4 #lightyellow
+        component "Client 5" as C5 #lightyellow
+    }
+    
+    package "应用服务" as AppServices2 {
+        component "Web 服务" as Web2 #lightcoral
+        component "API 服务" as API2 #lightcoral
+    }
+    
+    package "网络通信层" as Network2 {
+        component "LAN Serf\n(端口 8301)" as LAN2 #lightgray
+        component "Raft RPC\n(端口 8300)" as RPC2 #lightgray
+    }
+}
+
+package "跨数据中心通信" as WAN {
+    component "WAN Serf\n(端口 8302)" as WANSerf #orange
+    
+    note bottom of WANSerf : 跨数据中心\n服务器通信\n联邦管理
+}
+
+package "客户端接口层" as ClientInterface {
+    component "DNS 接口\n(端口 8600)" as DNS #pink
+    component "HTTP API\n(端口 8500)" as HTTP #pink
+    component "gRPC API\n(端口 8502)" as GRPC #pink
+    
+    note bottom of DNS : 服务发现\nDNS 查询
+    note bottom of HTTP : RESTful API\n服务管理
+    note bottom of GRPC : 现代 API\n高性能通信
+}
+
+package "数据存储层" as Storage {
+    package "Raft 共识层" as RaftLayer {
+        component "日志存储\n(BoltDB)" as LogStore #lightsteelblue
+        component "快照存储\n(文件系统)" as SnapStore #lightsteelblue
+        component "稳定存储\n(BoltDB)" as StableStore #lightsteelblue
+    }
+    
+    package "状态存储层" as StateLayer {
+        component "FSM\n有限状态机" as FSM #lightsalmon
+        component "内存数据库\n(MemDB)" as MemDB #lightsalmon
+        component "服务目录" as Catalog #lightsalmon
+        component "健康检查" as Health #lightsalmon
+        component "KV 存储" as KV #lightsalmon
+    }
+}
+
+package "外部客户端" as ExternalClients {
+    actor "应用程序" as App #lightcyan
+    actor "负载均衡器" as LB #lightcyan
+    actor "监控系统" as Monitor #lightcyan
+    actor "配置管理" as Config #lightcyan
+}
+
+' 数据中心内连接
+S1 <--> S2 : Raft 复制
+S2 <--> S3 : Raft 复制
+S3 <--> S1 : Raft 复制
+
+S4 <--> S5 : Raft 复制
+S5 <--> S6 : Raft 复制
+S6 <--> S4 : Raft 复制
+
+C1 --> S1 : RPC 请求
+C2 --> S2 : RPC 请求
+C3 --> S3 : RPC 请求
+
+C4 --> S4 : RPC 请求
+C5 --> S5 : RPC 请求
+
+Web1 --> C1 : 服务注册
+API1 --> C2 : 服务注册
+DB1 --> C3 : 服务注册
+
+Web2 --> C4 : 服务注册
+API2 --> C5 : 服务注册
+
+' LAN Serf 连接
+S1 <--> LAN1
+S2 <--> LAN1
+S3 <--> LAN1
+C1 <--> LAN1
+C2 <--> LAN1
+C3 <--> LAN1
+
+S4 <--> LAN2
+S5 <--> LAN2
+S6 <--> LAN2
+C4 <--> LAN2
+C5 <--> LAN2
+
+' RPC 连接
+S1 <--> RPC1
+S2 <--> RPC1
+S3 <--> RPC1
+
+S4 <--> RPC2
+S5 <--> RPC2
+S6 <--> RPC2
+
+' 跨数据中心连接
+S1 <--> WANSerf : WAN 通信
+S4 <--> WANSerf : WAN 通信
+
+' 客户端接口连接
+App --> DNS : DNS 查询
+LB --> HTTP : 服务发现
+Monitor --> HTTP : 健康检查
+Config --> GRPC : 配置管理
+
+DNS --> S1 : 查询转发
+HTTP --> S1 : API 请求
+GRPC --> S1 : gRPC 调用
+
+' 存储层连接
+S1 --> FSM : 状态变更
+FSM --> MemDB : 数据操作
+FSM --> LogStore : 日志写入
+FSM --> SnapStore : 快照创建
+FSM --> StableStore : 元数据存储
+
+MemDB --> Catalog : 服务数据
+MemDB --> Health : 健康数据
+MemDB --> KV : 键值数据
+
+@enduml

@@ -1,0 +1,143 @@
+@startuml Consul服务注册详细时序图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam maxMessageSize 100
+
+title Consul 服务注册详细时序图\n代码位置标注版
+
+actor "客户端应用" as Client
+participant "HTTP API\n(agent_endpoint.go)" as HTTP
+participant "Consul Agent\n(agent.go)" as Agent
+participant "本地状态管理\n(local/state.go)" as LocalState
+participant "Anti-Entropy\n(ae/ae.go)" as AE
+participant "Catalog RPC\n(catalog_endpoint.go)" as Catalog
+participant "Raft 共识层" as Raft
+participant "状态存储\n(state/catalog.go)" as Store
+
+== 第一阶段：HTTP API 请求处理 ==
+
+Client -> HTTP : PUT /v1/agent/service/register\n**位置**: api/agent.go:835-854
+note right of Client : JSON 格式的服务定义\n包含服务名、端口、健康检查等
+
+HTTP -> HTTP : 解析请求体\n**位置**: agent_endpoint.go:1150-1160
+note right of HTTP : 将 JSON 解析为\nstructs.ServiceDefinition
+
+HTTP -> HTTP : 验证服务名称\n**位置**: agent_endpoint.go:1162-1165
+note right of HTTP : 检查服务名称是否为空\nif args.Name == ""
+
+HTTP -> HTTP : 验证服务地址\n**位置**: agent_endpoint.go:1167-1171
+note right of HTTP : 检查是否为有效 IP 地址\nipaddr.IsAny(args.Address)
+
+HTTP -> HTTP : 解析 ACL Token\n**位置**: agent_endpoint.go:1173-1180
+note right of HTTP : 从请求头或参数中\n提取认证令牌
+
+HTTP -> HTTP : ACL 权限验证\n**位置**: agent_endpoint.go:1234-1237
+note right of HTTP : vetServiceRegisterWithAuthorizer()\n检查服务注册权限
+
+== 第二阶段：Agent 服务处理 ==
+
+HTTP -> Agent : AddService(req)\n**位置**: agent_endpoint.go:1260-1290
+note right of HTTP : 构造 AddServiceRequest\n包含服务定义和检查类型
+
+Agent -> Agent : 获取状态锁\n**位置**: agent.go:2348-2349
+note right of Agent : a.stateLock.Lock()\n防止并发修改
+
+Agent -> Agent : 验证服务配置\n**位置**: agent.go:2379-2381
+note right of Agent : validateService()\n检查服务定义的有效性
+
+Agent -> Agent : 处理 Sidecar 服务\n**位置**: agent_endpoint.go:1239-1259
+note right of Agent : sidecarServiceFromNodeService()\n处理 Connect 代理服务
+
+== 第三阶段：本地状态管理 ==
+
+Agent -> LocalState : AddServiceWithChecks()\n**位置**: agent.go:2553
+note right of Agent : 将服务和检查添加到\n本地状态管理器
+
+LocalState -> LocalState : 标记服务状态\n**位置**: local/state.go:1096
+note right of LocalState : s.InSync = false\n标记为需要同步
+
+LocalState -> LocalState : 触发同步通知\n**位置**: local/state.go:186
+note right of LocalState : TriggerSyncChanges()\n通知状态同步器
+
+== 第四阶段：Anti-Entropy 同步 ==
+
+LocalState -> AE : 触发部分同步\n**位置**: ae/ae.go:81
+note right of LocalState : SyncChanges.Trigger()\n非阻塞触发同步
+
+AE -> AE : 状态机转换\n**位置**: ae/ae.go:203-225
+note right of AE : partialSyncState\n处理增量同步事件
+
+AE -> LocalState : SyncChanges()\n**位置**: ae/ae.go:214
+note right of AE : 执行实际的状态同步\n遍历未同步的服务
+
+LocalState -> LocalState : 检查同步状态\n**位置**: local/state.go:1264-1277
+note right of LocalState : for id, s := range l.services\n检查 s.InSync 状态
+
+LocalState -> Catalog : syncService() RPC\n**位置**: local/state.go:1456-1475
+note right of LocalState : 构造 RegisterRequest\n调用 Catalog.Register
+
+== 第五阶段：Catalog RPC 处理 ==
+
+Catalog -> Catalog : 请求转发检查\n**位置**: catalog_endpoint.go:112-114
+note right of Catalog : ForwardRPC("Catalog.Register")\n如果不是 Leader 则转发
+
+Catalog -> Catalog : ACL 权限验证\n**位置**: catalog_endpoint.go:118-121
+note right of Catalog : ResolveTokenAndDefaultMeta()\n解析和验证 ACL 令牌
+
+Catalog -> Catalog : 验证注册请求\n**位置**: catalog_endpoint.go:130-148
+note right of Catalog : ValidateRegisterRequest()\n验证企业版元数据
+
+Catalog -> Catalog : 节点预处理\n**位置**: catalog_endpoint.go:136-141
+note right of Catalog : nodePreApply()\n验证节点信息
+
+Catalog -> Catalog : 服务预处理\n**位置**: catalog_endpoint.go:144-148
+note right of Catalog : servicePreApply()\n验证服务定义和 ACL
+
+Catalog -> Catalog : 检查预处理\n**位置**: catalog_endpoint.go:155-167
+note right of Catalog : checkPreApply()\n处理健康检查定义
+
+== 第六阶段：Raft 共识 ==
+
+Catalog -> Raft : RaftApply(RegisterRequest)\n**位置**: leader_registrator_v1.go:152
+note right of Catalog : 将注册请求提交到\nRaft 日志进行复制
+
+Raft -> Raft : 日志复制
+note right of Raft : 在集群节点间\n复制日志条目
+
+Raft -> Raft : 达成共识
+note right of Raft : 大多数节点确认\n日志条目
+
+== 第七阶段：状态存储更新 ==
+
+Raft -> Store : FSM Apply\n**位置**: state/catalog.go:143-151
+note right of Raft : 应用已提交的\n日志条目到状态机
+
+Store -> Store : 开始事务\n**位置**: state/catalog.go:144-145
+note right of Store : tx := s.db.WriteTxn(idx)\n开始写事务
+
+Store -> Store : 执行注册\n**位置**: state/catalog.go:147-149
+note right of Store : ensureRegistrationTxn()\n在事务中更新节点和服务
+
+Store -> Store : 提交事务\n**位置**: state/catalog.go:151
+note right of Store : tx.Commit()\n原子性提交所有更改
+
+== 第八阶段：响应和状态更新 ==
+
+Store --> Catalog : 注册成功响应
+Catalog --> LocalState : RPC 成功响应
+
+LocalState -> LocalState : 更新同步状态\n**位置**: local/state.go:1485-1489
+note right of LocalState : s.InSync = true\n标记服务已同步
+
+LocalState --> Agent : 同步完成通知
+Agent --> HTTP : 服务添加成功
+HTTP --> Client : HTTP 200 OK
+
+== 并行流程：健康检查启动 ==
+
+Agent -> Agent : 启动健康检查\n**位置**: agent.go:2560-2580
+note right of Agent : 为注册的服务\n启动相应的健康检查
+
+@enduml

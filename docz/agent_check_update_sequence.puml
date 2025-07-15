@@ -1,0 +1,311 @@
+@startuml AgentCheckUpdate时序图
+!theme plain
+title Consul AgentCheckUpdate 方法执行时序图
+
+participant "HTTP客户端" as Client
+participant "HTTPHandlers" as HTTP
+participant "Agent" as Agent
+participant "CheckTTL" as TTL
+participant "CheckNotifier" as Notifier
+participant "LocalState" as State
+participant "AntiEntropy" as AE
+participant "Consul集群" as Cluster
+
+note over Client, Cluster
+    AgentCheckUpdate API 调用流程
+    PUT /v1/agent/check/update/{checkID}
+end note
+
+== 1. HTTP请求处理阶段 ==
+
+Client ->> HTTP: PUT /v1/agent/check/update/{checkID}
+note right of Client
+    请求体包含:
+    {
+      "Status": "passing|warning|critical",
+      "Output": "检查输出信息"
+    }
+    代码位置: agent/agent_endpoint.go:928
+end note
+
+HTTP ->> HTTP: decodeBody(req.Body, &update)
+note right of HTTP
+    解析JSON请求体到checkUpdate结构体
+    代码位置: agent/agent_endpoint.go:930
+end note
+
+alt 请求解析失败
+    HTTP -->> Client: HTTP 400 Bad Request
+    note right of HTTP: 返回解析错误信息
+end
+
+HTTP ->> HTTP: 验证状态值
+note right of HTTP
+    检查Status是否为有效值:
+    - api.HealthPassing ("passing")
+    - api.HealthWarning ("warning") 
+    - api.HealthCritical ("critical")
+    代码位置: agent/agent_endpoint.go:934-940
+end note
+
+alt 状态值无效
+    HTTP -->> Client: HTTP 400 Bad Request
+    note right of HTTP: 返回"Invalid check status"错误
+end
+
+HTTP ->> HTTP: 提取CheckID
+note right of HTTP
+    从URL路径提取检查ID
+    代码位置: agent/agent_endpoint.go:942-943
+end note
+
+HTTP ->> HTTP: agentCheckUpdate(checkID, status, output)
+note right of HTTP
+    调用内部处理方法
+    代码位置: agent/agent_endpoint.go:945
+end note
+
+== 2. 权限验证和元数据处理阶段 ==
+
+HTTP ->> HTTP: 创建企业版元数据
+note right of HTTP
+    创建EnterpriseMeta结构
+    代码位置: agent/agent_endpoint.go:949-950
+end note
+
+HTTP ->> HTTP: parseToken(req, &token)
+note right of HTTP
+    从请求中提取ACL令牌
+    代码位置: agent/agent_endpoint.go:954
+end note
+
+HTTP ->> HTTP: parseEntMetaNoWildcard()
+note right of HTTP
+    解析企业版元数据（命名空间等）
+    代码位置: agent/agent_endpoint.go:956-958
+end note
+
+HTTP ->> Agent: delegate.ResolveTokenAndDefaultMeta()
+note right of HTTP
+    解析令牌并获取授权信息
+    代码位置: agent/agent_endpoint.go:960-963
+end note
+
+Agent -->> HTTP: authz, err
+
+alt 令牌解析失败
+    HTTP -->> Client: HTTP 403 Forbidden
+    note right of HTTP: 返回认证错误
+end
+
+HTTP ->> HTTP: cid.Normalize()
+note right of HTTP
+    标准化CheckID结构
+    代码位置: agent/agent_endpoint.go:965
+end note
+
+HTTP ->> Agent: vetCheckUpdateWithAuthorizer()
+note right of HTTP
+    验证检查更新权限
+    代码位置: agent/agent_endpoint.go:967-969
+end note
+
+Agent -->> HTTP: err
+
+alt 权限验证失败
+    HTTP -->> Client: HTTP 403 Forbidden
+    note right of HTTP: 返回权限不足错误
+end
+
+HTTP ->> HTTP: validateRequestPartition()
+note right of HTTP
+    验证请求分区
+    代码位置: agent/agent_endpoint.go:971-973
+end note
+
+== 3. TTL检查更新阶段 ==
+
+HTTP ->> Agent: updateTTLCheck(cid, status, output)
+note right of HTTP
+    更新TTL检查状态
+    代码位置: agent/agent_endpoint.go:975
+end note
+
+Agent ->> Agent: stateLock.Lock()
+note right of Agent
+    获取状态锁保护并发访问
+    代码位置: agent/agent.go:3478
+end note
+
+Agent ->> Agent: 查找TTL检查
+note right of Agent
+    从checkTTLs映射中查找检查
+    代码位置: agent/agent.go:3482
+end note
+
+alt TTL检查不存在
+    Agent -->> HTTP: 错误: CheckID不存在TTL
+    note right of Agent
+        返回"CheckID does not have associated TTL"
+        代码位置: agent/agent.go:3484
+    end note
+    HTTP -->> Client: HTTP 500 Internal Server Error
+end
+
+Agent ->> TTL: SetStatus(status, output)
+note right of Agent
+    设置TTL检查状态并重置TTL计时器
+    代码位置: agent/agent.go:3488
+end note
+
+TTL ->> TTL: 截断输出长度
+note right of TTL
+    如果输出超过最大长度则截断
+    代码位置: agent/checks/check.go:318-322
+end note
+
+TTL ->> Notifier: UpdateCheck(checkID, status, output)
+note right of TTL
+    通知检查状态更新
+    代码位置: agent/checks/check.go:323
+end note
+
+TTL ->> TTL: 保存最后输出
+note right of TTL
+    存储输出用于TTL过期时使用
+    代码位置: agent/checks/check.go:325-327
+end note
+
+TTL ->> TTL: timer.Reset(TTL)
+note right of TTL
+    重置TTL计时器
+    代码位置: agent/checks/check.go:329
+end note
+
+TTL -->> Agent: outputTruncated
+
+alt 开发模式（无数据目录）
+    Agent ->> Agent: stateLock.Unlock()
+    Agent -->> HTTP: nil
+    note right of Agent
+        开发模式下不持久化状态
+        代码位置: agent/agent.go:3491-3493
+    end note
+else 生产模式
+    Agent ->> Agent: persistCheckState()
+    note right of Agent
+        持久化检查状态到磁盘
+        代码位置: agent/agent.go:3497-3499
+    end note
+    
+    Agent ->> Agent: 创建持久化状态
+    note right of Agent
+        创建persistedCheckState结构
+        包含CheckID、Status、Output、Expires
+        代码位置: agent/agent.go:3508-3515
+    end note
+    
+    Agent ->> Agent: json.Marshal(state)
+    note right of Agent
+        序列化状态为JSON
+        代码位置: agent/agent.go:3518
+    end note
+    
+    Agent ->> Agent: 写入状态文件
+    note right of Agent
+        将状态写入数据目录
+        代码位置: agent/agent.go:3520+
+    end note
+end
+
+Agent ->> Agent: stateLock.Unlock()
+Agent -->> HTTP: nil
+
+== 4. 状态同步阶段 ==
+
+HTTP ->> HTTP: syncChanges()
+note right of HTTP
+    触发状态同步到集群
+    代码位置: agent/agent_endpoint.go:978
+end note
+
+HTTP ->> State: SyncChanges()
+note right of HTTP
+    调用本地状态同步方法
+    代码位置: agent/agent_endpoint.go:779
+end note
+
+State ->> State: Lock()
+note right of State
+    获取状态锁
+    代码位置: agent/local/state.go:1259
+end note
+
+State ->> State: 同步节点信息
+note right of State
+    如果节点信息未同步则先同步
+    代码位置: agent/local/state.go:1266-1273
+end note
+
+State ->> State: 遍历所有服务
+note right of State
+    检查需要同步的服务
+    代码位置: agent/local/state.go:1278-1293
+end note
+
+State ->> State: 遍历所有检查
+note right of State
+    检查需要同步的健康检查
+    代码位置: agent/local/state.go:1297-1314
+end note
+
+loop 对于每个未同步的检查
+    State ->> State: syncCheck(checkID)
+    note right of State
+        同步单个检查到集群
+        代码位置: agent/local/state.go:1307
+    end note
+    
+    State ->> Cluster: RPC调用 Catalog.Register
+    note right of State
+        通过RPC将检查注册到集群
+        包含检查状态、输出等信息
+    end note
+    
+    Cluster -->> State: 注册结果
+    
+    alt 同步成功
+        State ->> State: 标记检查为已同步
+        note right of State: c.InSync = true
+    else 同步失败
+        State ->> State: 记录错误
+        note right of State: 保持未同步状态，等待下次重试
+    end
+end
+
+State ->> State: Unlock()
+State -->> HTTP: 同步结果
+
+alt 同步失败
+    HTTP ->> HTTP: 记录错误日志
+    note right of HTTP
+        记录"failed to sync changes"错误
+        但不影响API响应
+        代码位置: agent/agent_endpoint.go:780
+    end note
+end
+
+== 5. 响应返回阶段 ==
+
+HTTP -->> Client: HTTP 200 OK
+note right of HTTP
+    返回空响应体表示成功
+    代码位置: agent/agent_endpoint.go:979
+end note
+
+note over Client, Cluster
+    整个流程完成，检查状态已更新并同步到集群
+    TTL计时器已重置，Anti-Entropy机制确保最终一致性
+end note
+
+@enduml

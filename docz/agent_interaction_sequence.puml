@@ -1,0 +1,199 @@
+@startuml Agent 交互时序图
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 20
+skinparam maxmessagesize 60
+skinparam sequenceParticipant underline
+
+title Consul Agent 核心交互时序图
+
+participant "外部客户端" as Client
+participant "HTTPHandlers" as HTTP
+participant "Agent" as Agent
+participant "local.State" as LocalState
+participant "ae.StateSyncer" as Syncer
+participant "delegate" as Delegate
+participant "cache.Cache" as Cache
+participant "ServiceManager" as ServiceMgr
+participant "checks.CheckHTTP" as CheckHTTP
+
+== Agent 启动流程 ==
+
+Client -> Agent: New(baseDeps)
+note right: 代码位置:\nagent/agent.go:444\n创建 Agent 实例
+
+Agent -> Agent: 初始化组件
+note right: 初始化各种检查映射\n设置状态锁和通道
+
+Agent -> LocalState: NewState(config, logger, tokens)
+note right: 代码位置:\nagent/local/state.go:225\n创建本地状态管理器
+
+Agent -> Syncer: NewStateSyncer(state, interval, shutdownCh, logger)
+note right: 代码位置:\nagent/ae/ae.go:120\n创建反熵同步器
+
+Agent -> ServiceMgr: NewServiceManager(agent)
+note right: 代码位置:\nagent/service_manager.go:41\n创建服务管理器
+
+Agent -> HTTP: NewHTTPHandlers(agent, denylist)
+note right: 创建 HTTP 处理器
+
+Client -> Agent: Start(ctx)
+note right: 启动 Agent 服务
+
+Agent -> Delegate: 根据配置创建 Server 或 Client
+note right: delegate 接口实现\n位置: agent/agent.go:155
+
+Agent -> Syncer: Run()
+note right: 启动反熵同步
+
+Agent -> HTTP: 启动 HTTP 服务器
+note right: 监听 HTTP 请求
+
+== 服务注册流程 ==
+
+Client -> HTTP: PUT /v1/agent/service/register
+note right: HTTP API 调用
+
+HTTP -> HTTP: AgentRegisterService()
+note right: 代码位置:\nagent/agent_endpoint.go:1150\n解析注册请求
+
+HTTP -> Agent: AddService(req)
+note right: 代码位置:\nagent/agent.go:2347\n添加服务到 Agent
+
+Agent -> Agent: addServiceLocked(req)
+note right: 获取状态锁\n验证服务配置
+
+Agent -> Agent: validateService()
+note right: 验证服务定义
+
+Agent -> LocalState: AddServiceWithChecks(service, checks, token, locallyRegistered)
+note right: 添加服务到本地状态
+
+LocalState -> LocalState: 更新服务映射
+note right: services[serviceID] = serviceState\n标记为未同步
+
+Agent -> ServiceMgr: AddService(req)
+note right: 如果是代理服务\n添加到服务管理器
+
+Agent -> Agent: 创建健康检查
+note right: 根据检查类型创建\n对应的检查实例
+
+Agent -> CheckHTTP: NewCheckHTTP(...)
+note right: 创建 HTTP 检查\n位置: agent/checks/check.go:333
+
+Agent -> CheckHTTP: Start()
+note right: 启动健康检查
+
+Agent -> LocalState: TriggerSyncChanges()
+note right: 触发反熵同步
+
+LocalState -> Syncer: SyncChangesEvent()
+note right: 通知同步器有变更
+
+== 反熵同步流程 ==
+
+Syncer -> Syncer: syncChangesEventFn()
+note right: 处理同步变更事件
+
+Syncer -> LocalState: SyncChanges()
+note right: 代码位置:\nagent/local/state.go:1245\n同步本地状态变更
+
+LocalState -> LocalState: 检查需要同步的服务
+note right: 遍历未同步的服务
+
+LocalState -> Delegate: RPC("Catalog.Register", args, reply)
+note right: 调用 Catalog 注册 RPC
+
+Delegate -> Delegate: 处理 RPC 调用
+note right: 转发到 Consul 服务器\n或本地处理
+
+LocalState -> LocalState: 标记服务已同步
+note right: service.InSync = true
+
+== 健康检查流程 ==
+
+CheckHTTP -> CheckHTTP: check()
+note right: 定期执行健康检查
+
+CheckHTTP -> CheckHTTP: 发送 HTTP 请求
+note right: 根据配置的 URL\n发送健康检查请求
+
+CheckHTTP -> LocalState: UpdateCheck(checkID, status, output)
+note right: 更新检查状态
+
+LocalState -> LocalState: 更新检查映射
+note right: checks[checkID].Status = status
+
+LocalState -> Syncer: TriggerSyncChanges()
+note right: 触发同步检查状态
+
+== 服务发现流程 ==
+
+Client -> HTTP: GET /v1/health/service/web
+note right: 查询服务健康状态
+
+HTTP -> HTTP: HealthServiceNodes()
+note right: 代码位置:\nagent/health_endpoint.go\n处理健康查询
+
+HTTP -> Cache: Get(ctx, "health", request)
+note right: 从缓存获取数据
+
+Cache -> Cache: 检查缓存是否有效
+note right: 检查 TTL 和索引
+
+alt 缓存未命中或过期
+    Cache -> Delegate: RPC("Health.ServiceNodes", args, reply)
+    note right: 调用健康检查 RPC
+    
+    Delegate -> Cache: 返回查询结果
+    note right: 更新缓存条目
+end
+
+Cache -> HTTP: 返回服务健康状态
+HTTP -> Client: JSON 响应
+
+== 配置重载流程 ==
+
+Client -> Agent: ReloadConfig(newConfig)
+note right: 重载配置
+
+Agent -> Agent: 验证新配置
+note right: 配置验证和处理
+
+Agent -> HTTP: ReloadConfig(newConfig)
+note right: 重载 HTTP 处理器配置
+
+Agent -> LocalState: 更新配置相关状态
+note right: 更新本地状态配置
+
+Agent -> Agent: 重启相关组件
+note right: 重启需要重新配置的组件
+
+== Agent 关闭流程 ==
+
+Client -> Agent: Shutdown()
+note right: 关闭 Agent
+
+Agent -> Syncer: 停止同步器
+note right: 停止反熵同步
+
+Agent -> Agent: 停止所有健康检查
+note right: 遍历并停止所有检查
+
+Agent -> CheckHTTP: Stop()
+note right: 停止 HTTP 检查
+
+Agent -> ServiceMgr: Stop()
+note right: 停止服务管理器
+
+Agent -> Delegate: Shutdown()
+note right: 关闭 delegate
+
+Agent -> HTTP: 关闭 HTTP 服务器
+note right: 停止 HTTP 监听
+
+Agent -> Agent: 清理资源
+note right: 关闭通道和清理状态
+
+@enduml
